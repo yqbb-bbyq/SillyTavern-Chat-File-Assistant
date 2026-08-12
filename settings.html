@@ -8,7 +8,7 @@
             <p class="cfa-help" data-i18n="cfa_description">AI summaries and display aliases for Manage Chat Files. Data is kept in IndexedDB by default.</p>
             <label for="cfa_provider_mode" data-i18n="cfa_provider">AI source</label>
             <select id="cfa_provider_mode" class="text_pole wide100p">
-                <option value="current" data-i18n="cfa_provider_current">Current SillyTavern API and preset</option>
+                <option value="current" data-i18n="cfa_provider_current">Current SillyTavern API and preset (independent background request)</option>
                 <option value="custom" data-i18n="cfa_provider_custom">OpenAI-compatible API preset</option>
             </select>
 
@@ -54,15 +54,16 @@
                 <small class="cfa-help" data-i18n="cfa_auto_summary_help">Default: 10 layers, equivalent to about 5 user/AI exchanges. Automatic generation can incur API charges.</small>
             </div>
             <div class="cfa-settings-grid">
-                <label><span data-i18n="cfa_input_tokens">Input token budget</span><input id="cfa_input_tokens" class="text_pole" type="number" min="1024" max="2000000" step="1024"></label>
-                <label><span data-i18n="cfa_output_tokens">Output token budget</span><input id="cfa_output_tokens" class="text_pole" type="number" min="64" max="65535" step="32"></label>
+                <label><span data-i18n="cfa_output_tokens">Reply token limit (custom API only)</span><input id="cfa_output_tokens" class="text_pole" type="number" min="64" max="65535" step="32"></label>
+                <label><span data-i18n="cfa_concurrent_requests">Maximum concurrent summaries</span><input id="cfa_concurrent_requests" class="text_pole" type="number" min="1" max="20" step="1"></label>
             </div>
+            <small class="cfa-help" data-i18n="cfa_concurrent_help">Default: 3. Additional summary requests wait in a queue. This only limits this extension's extra requests and does not block normal SillyTavern chat generation.</small>
             <fieldset class="cfa-api-box cfa-context-box">
                 <legend data-i18n="cfa_context_range">Chat context range</legend>
                 <label for="cfa_context_mode">
                     <span data-i18n="cfa_context_mode">Messages to send</span>
                     <select id="cfa_context_mode" class="text_pole wide100p">
-                        <option value="all" data-i18n="cfa_context_all">Send all (walk backward from the latest reply, up to the input budget)</option>
+                        <option value="all" data-i18n="cfa_context_all">Send all messages</option>
                         <option value="recent" data-i18n="cfa_context_recent">Send the latest X message layers</option>
                     </select>
                 </label>
@@ -70,7 +71,7 @@
                     <span data-i18n="cfa_recent_message_count">Latest message layers</span>
                     <input id="cfa_recent_message_count" class="text_pole" type="number" min="1" max="10000" step="1">
                 </label>
-                <small class="cfa-help" data-i18n="cfa_context_help">Both modes keep the newest content and stop at the input token budget. System messages do not count toward X but are retained when they fall inside the selected range.</small>
+                <small class="cfa-help" data-i18n="cfa_context_help">Recent mode counts non-system messages; system messages inside the selected range are retained as untrusted data.</small>
             </fieldset>
             <fieldset class="cfa-api-box cfa-storage-box">
                 <legend data-i18n="cfa_storage">Storage</legend>
@@ -81,15 +82,16 @@
                 </label>
                 <small class="cfa-help" data-i18n="cfa_write_warning">Embedded data follows exports and backups, but saving rewrites the chat JSONL. Enabling this does not rewrite old chats automatically.</small>
                 <div class="flex-container cfa-storage-actions">
-                    <button id="cfa_embed_existing" type="button" class="menu_button" data-i18n="cfa_embed_existing">Write this character/group's local data to chat files</button>
+                    <button id="cfa_embed_existing" type="button" class="menu_button" data-i18n="cfa_embed_existing">Write the current open chat's local data to its chat file</button>
                     <button id="cfa_rebuild_index" type="button" class="menu_button" data-i18n="cfa_rebuild_index">Rebuild this character/group's local index</button>
-                    <button id="cfa_clear_embedded" type="button" class="menu_button danger_button" data-i18n="cfa_clear_embedded">Remove embedded data for this character/group</button>
+                    <button id="cfa_clear_embedded" type="button" class="menu_button danger_button" data-i18n="cfa_clear_embedded">Remove embedded data from the current open chat</button>
                     <button id="cfa_cancel_storage" type="button" class="menu_button" data-i18n="cfa_cancel_storage">Cancel task</button>
                 </div>
                 <small id="cfa_storage_progress" class="cfa-help"></small>
             </fieldset>
             <div class="flex-container gap10px cfa-settings-actions">
                 <button id="cfa_reset_prompt" class="menu_button" data-i18n="cfa_reset_prompt">Reset prompt</button>
+                <button id="cfa_abort_all" class="menu_button danger_button cfa-abort-all" data-i18n="cfa_abort_all">Stop all summary requests</button>
                 <button id="cfa_clear_data" class="menu_button danger_button" data-i18n="cfa_clear_data">Clear local index data</button>
             </div>
         </div>

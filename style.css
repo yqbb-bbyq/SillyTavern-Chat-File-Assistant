@@ -26,6 +26,8 @@
 .cfa-preset-actions .menu_button,
 .cfa-model-actions .menu_button,
 .cfa-settings-actions .menu_button { width: auto !important; flex: 0 0 auto; white-space: nowrap; }
+.cfa-settings-actions .cfa-abort-all { background: #b52b2b !important; border-color: #e35b5b !important; color: #fff !important; }
+.cfa-settings-actions .cfa-abort-all:hover { background: #d13b3b !important; }
 .cfa-toolbar { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
 .cfa-toolbar .cfa-cancel { display: none; }
 .cfa-toolbar.cfa-running .cfa-cancel { display: inline-flex; }

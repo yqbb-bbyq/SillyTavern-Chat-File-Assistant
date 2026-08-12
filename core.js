@@ -9,8 +9,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
         providerMode: 'current',
         customPresetId: null,
         summaryPrompt: DEFAULT_SUMMARY_PROMPT,
-        maxInputTokens: 2000000,
         maxOutputTokens: 8096,
+        maxConcurrentRequests: 3,
         contextMode: 'all',
         recentMessageCount: 20,
         showUserName: true,
@@ -29,7 +29,10 @@ export function normalizeSettings(value) {
     const source = value && typeof value === 'object' ? value : {};
     const normalized = cloneDefaultSettings();
     if (Number(source.schemaVersion) !== SCHEMA_VERSION) return normalized;
-    normalized.config = { ...normalized.config, ...(source.config ?? {}) };
+    const sourceConfig = source.config && typeof source.config === 'object' ? source.config : {};
+    for (const key of Object.keys(normalized.config)) {
+        if (Object.hasOwn(sourceConfig, key)) normalized.config[key] = sourceConfig[key];
+    }
     normalized.apiPresets = Array.isArray(source.apiPresets)
         ? source.apiPresets.map(sanitizeApiPreset).filter(Boolean)
         : [];
@@ -38,10 +41,9 @@ export function normalizeSettings(value) {
     if (!normalized.apiPresets.some(preset => preset.id === normalized.config.customPresetId)) {
         normalized.config.customPresetId = normalized.apiPresets[0]?.id ?? null;
     }
-    delete normalized.config.profileId;
     normalized.config.summaryPrompt = String(normalized.config.summaryPrompt || DEFAULT_SUMMARY_PROMPT);
-    normalized.config.maxInputTokens = clampInteger(normalized.config.maxInputTokens, 1024, 2000000, 2000000);
     normalized.config.maxOutputTokens = clampInteger(normalized.config.maxOutputTokens, 64, 65535, 8096);
+    normalized.config.maxConcurrentRequests = clampInteger(normalized.config.maxConcurrentRequests, 1, 20, 3);
     normalized.config.contextMode = normalized.config.contextMode === 'recent' ? 'recent' : 'all';
     normalized.config.recentMessageCount = clampInteger(normalized.config.recentMessageCount, 1, 10000, 20);
     normalized.config.showUserName = normalized.config.showUserName !== false;
@@ -75,6 +77,7 @@ export function normalizeApiBaseUrl(value) {
     try {
         const url = new URL(text);
         if (!['http:', 'https:'].includes(url.protocol)) return '';
+        if (url.username || url.password || url.search) return '';
         return url.toString().replace(/\/$/, '');
     } catch {
         return '';
@@ -206,6 +209,13 @@ export function shouldAutoSummarize({ messageCount, lastSummaryCount = 0, interv
     return count >= step && (hasSummary ? count - last >= step : count >= step);
 }
 
+export function getAutoRetryAfterCount(messageCount, interval = 10, failureCount = 1) {
+    const count = Math.max(0, Number(messageCount) || 0);
+    const step = Math.max(1, Number(interval) || 10);
+    const failures = Math.max(1, Math.round(Number(failureCount) || 1));
+    return count + step * (2 ** Math.min(3, failures - 1));
+}
+
 export function chooseChatDate({ messages = [], fileName = '', lastMes = null } = {}) {
     const headerDate = messages[0]?.create_date ?? messages[0]?.createDate;
     const firstMessageDate = messages.find(message => message?.send_date)?.send_date;
@@ -267,7 +277,6 @@ export function serializeRecentMessages(messages = [], {
     skipHeader = false,
     mode = 'all',
     maxLayers = 20,
-    tokenBudget = Number.POSITIVE_INFINITY,
 } = {}) {
     let entries = getSerializableEntries(messages, { skipHeader });
     if (mode === 'recent') {
@@ -281,24 +290,7 @@ export function serializeRecentMessages(messages = [], {
         entries = entries.slice(start);
     }
 
-    const budget = Number.isFinite(tokenBudget) ? Math.max(1, Math.floor(tokenBudget)) : Number.POSITIVE_INFINITY;
-    const selected = [];
-    let usedTokens = 0;
-    const separatorTokens = estimateTokens('\n\n');
-    for (let index = entries.length - 1; index >= 0; index--) {
-        const unit = formatSerializableEntry(entries[index]);
-        const separator = selected.length ? separatorTokens : 0;
-        const unitTokens = estimateTokens(unit);
-        if (usedTokens + separator + unitTokens <= budget) {
-            selected.unshift(unit);
-            usedTokens += separator + unitTokens;
-            continue;
-        }
-        const truncated = truncateEntryFromEnd(entries[index], budget - usedTokens - separator);
-        if (truncated) selected.unshift(truncated);
-        break;
-    }
-    return selected.join('\n\n');
+    return entries.map(entry => formatSerializableEntry(entry)).join('\n\n');
 }
 
 function getSerializableEntries(messages, { skipHeader }) {
@@ -313,70 +305,6 @@ function formatSerializableEntry({ message, floor }, textOverride) {
     const name = String(message.name ?? message.character_name ?? role).replace(/[\r\n\]]/g, ' ');
     const text = String(textOverride ?? message.mes ?? message.content ?? '').trim();
     return `[Floor ${floor} | ${role} | ${name}]\n${text}`;
-}
-
-function truncateEntryFromEnd(entry, tokenBudget) {
-    if (tokenBudget <= 0) return '';
-    const content = String(entry.message.mes ?? entry.message.content ?? '').trim();
-    const marker = '[Earlier content omitted to fit the input budget]\n…';
-    let low = 0;
-    let high = content.length;
-    let best = '';
-    while (low <= high) {
-        const length = Math.floor((low + high) / 2);
-        const candidate = formatSerializableEntry(entry, `${marker}${content.slice(-length)}`);
-        if (estimateTokens(candidate) <= tokenBudget) {
-            best = candidate;
-            low = length + 1;
-        } else {
-            high = length - 1;
-        }
-    }
-    return best;
-}
-
-export function estimateTokens(text) {
-    const value = String(text ?? '');
-    const cjk = (value.match(/[\u3400-\u9fff\uf900-\ufaff]/g) ?? []).length;
-    const remaining = value.length - cjk;
-    return Math.ceil(cjk * 1.05 + remaining / 4);
-}
-
-export function splitTextByTokenBudget(text, tokenBudget) {
-    const source = String(text ?? '').trim();
-    if (!source) return [];
-    if (estimateTokens(source) <= tokenBudget) return [source];
-    const units = source.split(/\n{2,}/).flatMap(paragraph => splitOversizedUnit(paragraph, tokenBudget));
-    const chunks = [];
-    let current = '';
-    for (const unit of units) {
-        const candidate = current ? `${current}\n\n${unit}` : unit;
-        if (current && estimateTokens(candidate) > tokenBudget) {
-            chunks.push(current);
-            current = unit;
-        } else {
-            current = candidate;
-        }
-    }
-    if (current) chunks.push(current);
-    return chunks;
-}
-
-function splitOversizedUnit(unit, tokenBudget) {
-    if (estimateTokens(unit) <= tokenBudget) return [unit];
-    const maxChars = Math.max(256, Math.floor(tokenBudget * 2.5));
-    const result = [];
-    let remaining = unit;
-    while (remaining.length > maxChars) {
-        let cut = remaining.lastIndexOf('\n', maxChars);
-        if (cut < maxChars / 2) cut = remaining.lastIndexOf('。', maxChars) + 1;
-        if (cut < maxChars / 2) cut = remaining.lastIndexOf('. ', maxChars) + 1;
-        if (cut < maxChars / 2) cut = maxChars;
-        result.push(remaining.slice(0, cut).trim());
-        remaining = remaining.slice(cut).trim();
-    }
-    if (remaining) result.push(remaining);
-    return result;
 }
 
 export function matchesAllFragments(record, query) {

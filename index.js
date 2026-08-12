@@ -10,6 +10,7 @@ import {
     getChatUserName,
     getEmbeddedRecord,
     getFingerprint,
+    getAutoRetryAfterCount,
     getScopeKey,
     isRecordStale,
     matchesAllFragments,
@@ -18,13 +19,12 @@ import {
     normalizeSettings,
     normalizeApiBaseUrl,
     normalizeFileName,
-    parseScopeKey,
     prepareStoredRecord,
     serializeRecentMessages,
     shouldAutoSummarize,
     simpleHash,
 } from './core.js';
-import { getChatInputBudget, summarizeWithChunking } from './ai.js';
+import { KEYLESS_SECRET_ID, setMaxConcurrentRequests, summarizeWithChunking } from './ai.js';
 import { IndexedRecordStore } from './storage.js';
 
 const MODULE_NAME = 'chatFileAssistant';
@@ -51,8 +51,16 @@ let userNameQueueRunning = false;
 const eventBindings = [];
 let previousFetch = null;
 let installedFetch = null;
+let installedFetchState = null;
 let embeddedObserver = null;
 let storageTaskController = null;
+let storageTaskPromise = null;
+let backgroundReadController = new AbortController();
+let userNamePumpPromise = null;
+let dataEpoch = 0;
+let dataResetting = false;
+let lifecycleEpoch = 0;
+let activationController = null;
 
 const strings = {
     en: {
@@ -63,16 +71,19 @@ const strings = {
         original: 'Original file', generating: 'Generating…', failed: 'Generation failed', empty: 'This chat is empty.',
         aliasTitle: 'Display alias', aliasHelp: 'This only changes the plugin display alias. The real chat filename is not modified.',
         clearConfirm: 'Clear this account\'s local IndexedDB summaries, suggestions, and aliases? Embedded copies in chat files will remain, and chat-file synchronization will be turned off.',
-        clearEmbeddedConfirm: 'Remove embedded plugin data from every chat of the current character or group? This rewrites affected chat files.',
+        clearEmbeddedConfirm: 'Remove embedded plugin data from the currently open chat? This saves that chat.',
         cleaned: 'Local IndexedDB data cleared. Embedded chat-file copies were not changed.', progress: (a, b) => `${a} / ${b}`,
         batchDone: 'Batch processing finished.', batchCancelled: 'Batch processing cancelled.',
+        abortAll: 'Stop all summary requests', abortedAll: 'All active and queued summary requests were cancelled.',
         presetName: 'Preset name', presetNameRequired: 'Enter a preset name.', invalidUrl: 'Enter a valid HTTP(S) API base URL.',
         modelRequired: 'Enter a model name.', keySaved: 'Key saved; leave blank to keep it.', keyOptional: 'Optional for keyless/local APIs.',
         presetSaved: 'API preset saved.', presetDeleted: 'API preset deleted.', deletePreset: 'Delete this API preset?',
         noPreset: 'Create and save an API preset first.', modelsLoaded: n => `${n} models loaded.`, modelsFailed: 'Could not fetch models.',
         storageError: 'Could not open the local IndexedDB cache.', writeFailed: 'Could not write plugin data to the chat file.',
         generationChanged: 'The chat changed while the summary was being generated. Please retry.',
+        historicalWriteUnsafe: 'SillyTavern 1.18 cannot safely update metadata in a closed historical chat without risking concurrent message loss. Open that chat before writing or clearing embedded data.',
         noActiveScope: 'Select a character or group before running this storage task.',
+        noActiveChat: 'Open a chat before writing or clearing embedded data.', noStoredRecord: 'The current chat has no local summary or alias to embed.',
         storageDone: 'Storage task finished.', storageCancelled: 'Storage task cancelled.', storageSkip: 'Skipped a chat that changed while it was being processed.',
     },
     zh: {
@@ -83,16 +94,19 @@ const strings = {
         original: '原始文件', generating: '正在生成…', failed: '生成失败', empty: '该聊天没有可总结的消息。',
         aliasTitle: '显示别名', aliasHelp: '这里只修改插件显示的别名，不会修改真实聊天文件名。',
         clearConfirm: '清除当前账户保存在本机 IndexedDB 的全部总结、建议标题和显示别名？聊天文件中的内嵌副本会保留，同时将关闭聊天文件同步。',
-        clearEmbeddedConfirm: '清除当前角色或群聊全部聊天文件中的插件数据？此操作会改写受影响的聊天文件。',
+        clearEmbeddedConfirm: '清除当前已打开聊天文件中的插件数据？此操作会保存该聊天。',
         cleaned: '本地 IndexedDB 数据已清除；聊天文件中的内嵌副本未改动。', progress: (a, b) => `${a} / ${b}`,
         batchDone: '批量处理完成。', batchCancelled: '已取消批量处理。',
+        abortAll: '中断所有请求', abortedAll: '已取消全部正在运行和排队的总结请求。',
         presetName: '方案名称', presetNameRequired: '请输入方案名称。', invalidUrl: '请输入有效的 HTTP(S) API 基础地址。',
         modelRequired: '请输入模型名称。', keySaved: '密钥已保存；留空将保持不变。', keyOptional: '无密钥或本地 API 可留空。',
         presetSaved: 'API 方案已保存。', presetDeleted: 'API 方案已删除。', deletePreset: '删除当前 API 方案？',
         noPreset: '请先新建并保存一个 API 方案。', modelsLoaded: n => `已载入 ${n} 个模型。`, modelsFailed: '无法获取模型列表。',
         storageError: '无法打开本地 IndexedDB 缓存。', writeFailed: '无法将插件数据写入聊天文件。',
         generationChanged: '生成总结期间聊天内容发生了变化，请重试。',
+        historicalWriteUnsafe: 'SillyTavern 1.18 无法在不冒并发消息丢失风险的情况下安全修改未打开历史聊天的元数据。请先打开该聊天，再写入或清除内嵌数据。',
         noActiveScope: '请先选择一个角色或群聊，再运行存储任务。',
+        noActiveChat: '请先打开一个聊天，再写入或清除内嵌数据。', noStoredRecord: '当前聊天没有可内嵌的本地总结或别名。',
         storageDone: '存储任务已完成。', storageCancelled: '存储任务已取消。', storageSkip: '聊天在处理期间发生变化，已跳过。',
     },
 };
@@ -120,13 +134,21 @@ function recordFor(scopeKey, fileName, create = false) {
     return recordStore.record(scopeKey, fileName, create);
 }
 
-function configHash() {
-    const config = settings.config;
-    const customPreset = settings.apiPresets.find(preset => preset.id === config.customPresetId);
+async function reconcileScopeRecords(scopeKey, nativeResults, expectedEpoch = dataEpoch) {
+    if (expectedEpoch !== dataEpoch) return;
+    await recordStore.loadScope(scopeKey);
+    if (expectedEpoch !== dataEpoch) return;
+    const liveFiles = new Set(nativeResults.map(item => normalizeFileName(item.file_name ?? item.file_id)));
+    const staleFiles = Object.keys(recordStore.scope(scopeKey) ?? {}).filter(fileName => !liveFiles.has(fileName));
+    await Promise.all(staleFiles.map(fileName => recordStore.delete(scopeKey, fileName)));
+}
+
+function configHash(config = settings.config) {
+    const customPreset = config.customPreset
+        ?? settings.apiPresets.find(preset => preset.id === config.customPresetId);
     return simpleHash(JSON.stringify({
         summaryPrompt: config.summaryPrompt,
-        maxInputTokens: config.maxInputTokens,
-        maxOutputTokens: config.maxOutputTokens,
+        maxOutputTokens: config.providerMode === 'custom' ? config.maxOutputTokens : null,
         contextMode: config.contextMode,
         recentMessageCount: config.contextMode === 'recent' ? config.recentMessageCount : null,
         providerMode: config.providerMode,
@@ -140,15 +162,26 @@ function generationConfig() {
     return config;
 }
 
+function abortAllSummaryRequests() {
+    batchController?.abort();
+    for (const controller of activeControllers.values()) controller.abort();
+    globalThis.toastr?.info(s().abortedAll);
+}
+
 function save() {
     context.saveSettingsDebounced();
 }
 
+function isCurrentChatTarget(scopeKey, fileName, liveContext = SillyTavern.getContext()) {
+    return currentScope().key === scopeKey && normalizeFileName(liveContext.chatId) === normalizeFileName(fileName);
+}
+
 async function saveRecord(scopeKey, fileName, record, { embed = settings.config.writeToChatFiles, messages = null } = {}) {
+    if (dataResetting) throw new DOMException('The local index is being reset.', 'AbortError');
     const stored = prepareStoredRecord(record, { recordId: record?.recordId || newId() });
     Object.assign(record, stored);
     await recordStore.put(scopeKey, fileName, record);
-    if (embed) {
+    if (embed && isCurrentChatTarget(scopeKey, fileName)) {
         try { await writeEmbeddedRecord(scopeKey, fileName, record, messages); }
         catch (error) {
             console.error('[Chat File AI] Embedded chat-file write failed; the IndexedDB copy is intact:', error);
@@ -158,12 +191,12 @@ async function saveRecord(scopeKey, fileName, record, { embed = settings.config.
     return record;
 }
 
-async function getUserHandle() {
-    try {
-        const response = await fetch('/api/users/me', { headers: context.getRequestHeaders() });
-        if (response.ok) return String((await response.json())?.handle || 'default-user');
-    } catch { /* Single-user installs may not expose a useful profile. */ }
-    return 'default-user';
+export async function getUserHandle({ fetchFn = globalThis.fetch, headers = context?.getRequestHeaders?.(), signal = null } = {}) {
+    const response = await fetchFn('/api/users/me', { headers, signal });
+    if (!response.ok) throw new Error(`Unable to identify the current SillyTavern user (${response.status}).`);
+    const handle = String((await response.json())?.handle ?? '').trim();
+    if (!handle) throw new Error('SillyTavern did not return a current user handle.');
+    return handle;
 }
 
 function parseSearchRequest(input, init) {
@@ -180,24 +213,47 @@ function parseSearchRequest(input, init) {
     }
 }
 
-function installFetchWrapper() {
+export function parseDeletedGroupId(input, init, baseUrl = globalThis.location?.href ?? 'http://localhost/') {
+    try {
+        const base = new URL(baseUrl);
+        const url = typeof input === 'string' || input instanceof URL ? new URL(input, baseUrl) : new URL(input.url, baseUrl);
+        if (url.origin !== base.origin || url.pathname !== '/api/groups/delete' || typeof init?.body !== 'string') return null;
+        return String(JSON.parse(init.body)?.id ?? '').trim() || null;
+    } catch {
+        return null;
+    }
+}
+
+export function installFetchWrapper() {
     if (fetchInstalled) return;
-    previousFetch = globalThis.fetch;
+    const delegate = globalThis.fetch;
+    const state = { enabled: true };
+    previousFetch = delegate;
+    installedFetchState = state;
     installedFetch = async function cfaFetch(input, init) {
+        if (!state.enabled) return Reflect.apply(delegate, globalThis, [input, init]);
         const parsed = parseSearchRequest(input, init);
+        const deletedGroupId = parseDeletedGroupId(input, init);
         const query = String(parsed?.body?.query ?? '').trim();
         if (parsed && !query && settings.config.writeToChatFiles && !parsed.body.group_id) {
-            try { return await fetchCharacterListWithMetadata(parsed, init); }
+            try { return await fetchCharacterListWithMetadata(parsed, init, delegate); }
             catch (error) { console.warn('[Chat File AI] Batched chat metadata load failed; using the native search:', error); }
         }
-        const response = await Reflect.apply(previousFetch, globalThis, [input, init]);
+        const response = await Reflect.apply(delegate, globalThis, [input, init]);
+        if (deletedGroupId && response.ok) {
+            const scopeKey = getScopeKey({ groupId: deletedGroupId });
+            void recordStore.deleteScope(scopeKey).then(() => {
+                metadataCache.delete(scopeKey); metadataByScope.delete(scopeKey);
+            }).catch(error => console.warn('[Chat File AI] Deleted group cache cleanup failed:', error));
+        }
         if (!parsed || !response.ok) return response;
         if (!query) {
+            const expectedEpoch = dataEpoch;
             void response.clone().json().then(nativeResults => {
-                if (!Array.isArray(nativeResults)) return;
+                if (!Array.isArray(nativeResults) || expectedEpoch !== dataEpoch) return;
                 metadataCache.set(parsed.scopeKey, nativeResults);
                 metadataByScope.set(parsed.scopeKey, new Map(nativeResults.map(item => [normalizeFileName(item.file_name), item])));
-                return recordStore.loadScope(parsed.scopeKey).then(() => requestAnimationFrame(renderVisibleCards));
+                return reconcileScopeRecords(parsed.scopeKey, nativeResults, expectedEpoch).then(() => requestAnimationFrame(renderVisibleCards));
             }).catch(error => console.warn('[Chat File AI] Metadata caching failed:', error));
             return response;
         }
@@ -235,14 +291,16 @@ function installFetchWrapper() {
     fetchInstalled = true;
 }
 
-async function fetchCharacterListWithMetadata(parsed, init) {
-    const response = await Reflect.apply(previousFetch, globalThis, ['/api/characters/chats', {
+async function fetchCharacterListWithMetadata(parsed, init, delegate) {
+    const expectedEpoch = dataEpoch;
+    const response = await Reflect.apply(delegate, globalThis, ['/api/characters/chats', {
         method: 'POST', headers: init?.headers ?? context.getRequestHeaders(),
         body: JSON.stringify({ avatar_url: parsed.body.avatar_url, metadata: true }),
     }]);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const source = await response.json();
     if (!Array.isArray(source)) throw new Error('Unexpected character chats response.');
+    if (expectedEpoch !== dataEpoch) throw new DOMException('The operation was aborted.', 'AbortError');
     await recordStore.loadScope(parsed.scopeKey);
     const nativeResults = [];
     const embeddedRecords = [];
@@ -263,7 +321,9 @@ async function fetchCharacterListWithMetadata(parsed, init) {
             embeddedRecords.push([fileName, merged]);
         }
     }
-    if (embeddedRecords.length) await recordStore.putMany(parsed.scopeKey, embeddedRecords);
+    if (embeddedRecords.length && expectedEpoch === dataEpoch) await recordStore.putMany(parsed.scopeKey, embeddedRecords);
+    await reconcileScopeRecords(parsed.scopeKey, nativeResults, expectedEpoch);
+    if (expectedEpoch !== dataEpoch) throw new DOMException('The operation was aborted.', 'AbortError');
     metadataCache.set(parsed.scopeKey, nativeResults);
     metadataByScope.set(parsed.scopeKey, new Map(nativeResults.map(item => [normalizeFileName(item.file_name), item])));
     requestAnimationFrame(renderVisibleCards);
@@ -273,23 +333,25 @@ async function fetchCharacterListWithMetadata(parsed, init) {
     });
 }
 
-function uninstallFetchWrapper() {
+export function uninstallFetchWrapper() {
     if (!fetchInstalled) return;
+    installedFetchState.enabled = false;
     if (globalThis.fetch === installedFetch) globalThis.fetch = previousFetch;
-    else console.warn('[Chat File AI] Another extension replaced fetch after this extension; leaving the chain untouched until reload.');
+    else console.warn('[Chat File AI] Another extension replaced fetch after this extension; the inactive wrapper will remain as a pass-through.');
     fetchInstalled = false;
     installedFetch = null;
+    installedFetchState = null;
     previousFetch = null;
 }
 
-async function readChat(fileName, scope = currentScope()) {
+async function readChat(fileName, scope = currentScope(), signal = null) {
     const headers = context.getRequestHeaders();
     const endpoint = scope.groupId ? '/api/chats/group/get' : '/api/chats/get';
     const body = scope.groupId
         ? { id: normalizeFileName(fileName) }
         : { file_name: normalizeFileName(fileName), avatar_url: scope.avatar };
     const fetchFn = previousFetch ?? globalThis.fetch;
-    const response = await Reflect.apply(fetchFn, globalThis, [endpoint, { method: 'POST', headers, cache: 'no-cache', body: JSON.stringify(body) }]);
+    const response = await Reflect.apply(fetchFn, globalThis, [endpoint, { method: 'POST', headers, cache: 'no-cache', body: JSON.stringify(body), signal }]);
     if (!response.ok) throw new Error(`Unable to read chat (${response.status}).`);
     const messages = await response.json();
     if (!Array.isArray(messages)) throw new Error('The chat response was not an array.');
@@ -300,66 +362,28 @@ function messagesFingerprint(messages, scope) {
     return getChatContentGuard(messages, { skipHeader: !scope.groupId });
 }
 
-async function saveChatSnapshot(fileName, scope, messages) {
-    const endpoint = scope.groupId ? '/api/chats/group/save' : '/api/chats/save';
-    const body = scope.groupId
-        ? { id: normalizeFileName(fileName), chat: messages }
-        : {
-            file_name: normalizeFileName(fileName),
-            avatar_url: scope.avatar,
-            ch_name: '',
-            chat: messages,
-        };
-    const response = await fetch(endpoint, {
-        method: 'POST', headers: context.getRequestHeaders(), cache: 'no-cache', body: JSON.stringify(body),
-    });
-    if (!response.ok) throw new Error(`${s().writeFailed} (${response.status})`);
-}
-
 async function writeEmbeddedRecord(scopeKey, fileName, record, suppliedMessages = null) {
-    const current = currentScope();
-    const scope = current.key === scopeKey ? current : { key: scopeKey, ...parseScopeKey(scopeKey) };
     const normalized = normalizeFileName(fileName);
     const liveContext = SillyTavern.getContext();
-    const isCurrent = current.key === scopeKey && normalizeFileName(liveContext.chatId) === normalized;
-    if (isCurrent) {
+    if (isCurrentChatTarget(scopeKey, normalized, liveContext)) {
         liveContext.chatMetadata[CHAT_METADATA_KEY] = structuredClone(record);
         await liveContext.saveMetadata();
         return;
     }
-    const firstRead = suppliedMessages ?? await readChat(normalized, scope);
-    if (!Array.isArray(firstRead) || !firstRead[0]?.chat_metadata) throw new Error(s().writeFailed);
-    const guard = messagesFingerprint(firstRead, scope);
-    const secondRead = await readChat(normalized, scope);
-    if (!chatGuardsEqual(guard, messagesFingerprint(secondRead, scope))) {
-        globalThis.toastr?.warning(s().storageSkip);
-        return false;
-    }
-    secondRead[0].chat_metadata[CHAT_METADATA_KEY] = structuredClone(record);
-    await saveChatSnapshot(normalized, scope, secondRead);
-    return true;
+    void suppliedMessages;
+    throw new Error(s().historicalWriteUnsafe);
 }
 
 async function removeEmbeddedRecord(scopeKey, fileName) {
-    const current = currentScope();
-    const scope = current.key === scopeKey ? current : { key: scopeKey, ...parseScopeKey(scopeKey) };
     const normalized = normalizeFileName(fileName);
     const liveContext = SillyTavern.getContext();
-    const isCurrent = current.key === scopeKey && normalizeFileName(liveContext.chatId) === normalized;
-    if (isCurrent) {
+    if (isCurrentChatTarget(scopeKey, normalized, liveContext)) {
         if (!Object.hasOwn(liveContext.chatMetadata, CHAT_METADATA_KEY)) return;
         delete liveContext.chatMetadata[CHAT_METADATA_KEY];
         await liveContext.saveMetadata();
         return;
     }
-    const firstRead = await readChat(normalized, scope);
-    if (!firstRead[0]?.chat_metadata || !Object.hasOwn(firstRead[0].chat_metadata, CHAT_METADATA_KEY)) return;
-    const guard = messagesFingerprint(firstRead, scope);
-    const secondRead = await readChat(normalized, scope);
-    if (!chatGuardsEqual(guard, messagesFingerprint(secondRead, scope))) return false;
-    delete secondRead[0].chat_metadata[CHAT_METADATA_KEY];
-    await saveChatSnapshot(normalized, scope, secondRead);
-    return true;
+    throw new Error(s().historicalWriteUnsafe);
 }
 
 async function restoreEmbeddedRecord(fileName, scope = currentScope(), messages = null, { render = true } = {}) {
@@ -378,8 +402,10 @@ function metaFor(scopeKey, fileName) {
     return metadataByScope.get(scopeKey)?.get(normalizeFileName(fileName)) ?? {};
 }
 
-async function generateFor(fileName, card = null, externalSignal = null) {
-    const scope = currentScope();
+async function generateFor(fileName, card = null, externalSignal = null, targetScope = currentScope()) {
+    if (dataResetting) throw new DOMException('The local index is being reset.', 'AbortError');
+    const scope = { ...targetScope };
+    const taskDataEpoch = dataEpoch;
     const key = `${scope.key}\n${normalizeFileName(fileName)}`;
     if (activeJobs.has(key)) return activeJobs.get(key);
     const controller = new AbortController();
@@ -388,20 +414,22 @@ async function generateFor(fileName, card = null, externalSignal = null) {
     const job = (async () => {
         setCardBusy(card, true);
         try {
-            const rawMessages = await readChat(fileName, scope);
+            const taskConfig = generationConfig();
+            const taskPromptHash = configHash(taskConfig);
+            const rawMessages = await readChat(fileName, scope, controller.signal);
             const skipHeader = !scope.groupId;
             const serialized = serializeRecentMessages(rawMessages, {
                 skipHeader,
-                mode: settings.config.contextMode,
-                maxLayers: settings.config.recentMessageCount,
-                tokenBudget: getChatInputBudget(settings.config),
+                mode: taskConfig.contextMode,
+                maxLayers: taskConfig.recentMessageCount,
             });
             if (!serialized) throw new Error(s().empty);
-            const result = await summarizeWithChunking(serialized, generationConfig(), context, controller.signal, progress => {
+            const result = await summarizeWithChunking(serialized, taskConfig, context, controller.signal, progress => {
                 updateCardProgress(card, progress);
             });
             controller.signal.throwIfAborted();
-            const latestMessages = await readChat(fileName, scope);
+            const latestMessages = await readChat(fileName, scope, controller.signal);
+            if (taskDataEpoch !== dataEpoch) throw new DOMException('The operation was aborted.', 'AbortError');
             if (!chatGuardsEqual(messagesFingerprint(rawMessages, scope), messagesFingerprint(latestMessages, scope))) {
                 throw new Error(s().generationChanged);
             }
@@ -419,12 +447,14 @@ async function generateFor(fileName, card = null, externalSignal = null) {
             const userName = getChatUserName(rawMessages, { skipHeader });
             const messageCountAtGeneration = countConversationLayers(rawMessages, { skipHeader });
             Object.assign(existing, {
-                fingerprint: getFingerprint(meta), promptHash: configHash(), summary: result.summary,
+                fingerprint: getFingerprint(meta), promptHash: taskPromptHash, summary: result.summary,
                 suggestedTitle: formatAlias(aliasDate, result.title), acceptedAlias: formatAlias(aliasDate, result.title),
                 userName: userName || existing.userName || '', messageCountAtGeneration,
                 generatedAt: new Date().toISOString(), stale: false,
-                generator: { mode: settings.config.providerMode, presetId: settings.config.customPresetId },
+                generator: { mode: taskConfig.providerMode, presetId: taskConfig.customPresetId },
             });
+            delete existing.autoFailureCount;
+            delete existing.autoRetryAfterCount;
             await saveRecord(scope.key, fileName, existing, { messages: latestMessages });
             renderVisibleCards();
             return existing;
@@ -583,20 +613,22 @@ function queueUserNameLookup(fileName, scope) {
     const key = `${scope.key}\n${normalized}`;
     if (userNameJobs.has(key)) return;
     userNameJobs.add(key);
-    userNameQueue.push({ key, fileName: normalized, scope: { ...scope } });
+    userNameQueue.push({ key, fileName: normalized, scope: { ...scope }, epoch: dataEpoch });
     void pumpUserNameQueue();
 }
 
-async function pumpUserNameQueue() {
-    if (userNameQueueRunning || !initialized) return;
+function pumpUserNameQueue() {
+    if (userNamePumpPromise || !initialized) return userNamePumpPromise;
     userNameQueueRunning = true;
-    try {
+    userNamePumpPromise = (async () => {
         while (initialized && userNameQueue.length) {
             const job = userNameQueue.shift();
             try {
-                const messages = await readChat(job.fileName, job.scope);
-                if (!initialized) break;
+                if (job.epoch !== dataEpoch) continue;
+                const messages = await readChat(job.fileName, job.scope, backgroundReadController.signal);
+                if (!initialized || job.epoch !== dataEpoch) continue;
                 if (job.restoreEmbedded) {
+                    if (!settings.config.writeToChatFiles) continue;
                     await restoreEmbeddedRecord(job.fileName, job.scope, messages);
                     continue;
                 }
@@ -611,10 +643,15 @@ async function pumpUserNameQueue() {
                     }
                 }
             } catch (error) {
-                console.debug('[Chat File AI] Could not read historical user name:', error);
+                if (error?.name !== 'AbortError') console.debug('[Chat File AI] Could not read historical user name:', error);
             } finally { userNameJobs.delete(job.key); }
         }
-    } finally { userNameQueueRunning = false; }
+    })().finally(() => {
+        userNameQueueRunning = false;
+        userNamePumpPromise = null;
+        if (initialized && userNameQueue.length) void pumpUserNameQueue();
+    });
+    return userNamePumpPromise;
 }
 
 function renderVisibleCards() {
@@ -664,7 +701,7 @@ function queueEmbeddedRestore(fileName, card, scope = currentScope()) {
     const key = `embedded\n${scope.key}\n${normalizeFileName(fileName)}`;
     if (userNameJobs.has(key)) return;
     userNameJobs.add(key);
-    userNameQueue.push({ key, fileName: normalizeFileName(fileName), scope: { ...scope }, restoreEmbedded: true, card });
+    userNameQueue.push({ key, fileName: normalizeFileName(fileName), scope: { ...scope }, restoreEmbedded: true, card, epoch: dataEpoch });
     void pumpUserNameQueue();
 }
 
@@ -720,13 +757,19 @@ async function runBatch() {
     batchRunning = true;
     batchController = new AbortController();
     try {
-        for (let index = 0; index < jobs.length; index++) {
-            batchController.signal.throwIfAborted();
-            updateBatchToolbar(index + 1, jobs.length);
-            const card = jobs[index];
-            try { await generateFor(card.dataset.cfaFile, card, batchController.signal); }
-            catch (error) { if (error?.name === 'AbortError') throw error; }
-        }
+        let nextIndex = 0;
+        let completed = 0;
+        const worker = async () => {
+            while (nextIndex < jobs.length) {
+                batchController.signal.throwIfAborted();
+                const card = jobs[nextIndex++];
+                try { await generateFor(card.dataset.cfaFile, card, batchController.signal, scope); }
+                catch (error) { if (error?.name === 'AbortError') throw error; }
+                finally { updateBatchToolbar(++completed, jobs.length); }
+            }
+        };
+        const workerCount = Math.min(settings.config.maxConcurrentRequests, jobs.length);
+        await Promise.all(Array.from({ length: workerCount }, worker));
         globalThis.toastr?.success(s().batchDone);
     } catch (error) {
         if (error?.name === 'AbortError') globalThis.toastr?.info(s().batchCancelled);
@@ -786,6 +829,8 @@ function stopObserver() {
 function updateProviderVisibility() {
     const box = document.querySelector('#cfa_custom_api');
     if (box) box.hidden = settings.config.providerMode !== 'custom';
+    const outputTokens = document.querySelector('#cfa_output_tokens');
+    if (outputTokens) outputTokens.disabled = settings.config.providerMode !== 'custom';
 }
 
 function presetById(id) {
@@ -796,27 +841,41 @@ function newId() {
     return globalThis.crypto?.randomUUID?.() ?? `cfa-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-async function writeApiSecret(value, label) {
-    let priorActiveId = null;
+async function rotateApiSecret(id) {
     try {
-        const stateResponse = await fetch('/api/secrets/read', { method: 'POST', headers: context.getRequestHeaders() });
-        const state = stateResponse.ok ? await stateResponse.json() : {};
-        priorActiveId = Array.isArray(state?.api_key_custom)
-            ? state.api_key_custom.find(secret => secret?.active)?.id ?? null
-            : null;
-    } catch { /* A missing prior state does not prevent saving the new secret. */ }
+        const response = await fetch('/api/secrets/rotate', {
+            method: 'POST', headers: context.getRequestHeaders(),
+            body: JSON.stringify({ key: 'api_key_custom', id }),
+        });
+        return response.ok;
+    } catch {
+        return false;
+    }
+}
+
+async function writeApiSecret(value, label, replacingId = null) {
+    let priorActiveId = null;
+    const stateResponse = await fetch('/api/secrets/read', { method: 'POST', headers: context.getRequestHeaders() });
+    if (!stateResponse.ok) throw new Error(`Unable to read the current shared API key state (${stateResponse.status}).`);
+    const state = await stateResponse.json();
+    priorActiveId = Array.isArray(state?.api_key_custom)
+        ? state.api_key_custom.find(secret => secret?.active)?.id ?? null
+        : null;
     const response = await fetch('/api/secrets/write', {
         method: 'POST', headers: context.getRequestHeaders(),
         body: JSON.stringify({ key: 'api_key_custom', value, label: `Chat File AI: ${label}` }),
     });
     if (!response.ok) throw new Error(`Unable to save API key (${response.status}).`);
     const id = (await response.json()).id;
-    if (priorActiveId && priorActiveId !== id) {
-        const rotateResponse = await fetch('/api/secrets/rotate', {
-            method: 'POST', headers: context.getRequestHeaders(),
-            body: JSON.stringify({ key: 'api_key_custom', id: priorActiveId }),
-        });
-        if (!rotateResponse.ok) console.warn('[Chat File AI] Could not restore the previously active shared custom API key.');
+    const activeAfterWrite = priorActiveId === replacingId ? id : priorActiveId;
+    if (activeAfterWrite && activeAfterWrite !== id) {
+        if (!await rotateApiSecret(activeAfterWrite)) {
+            try { await deleteApiSecret(id); }
+            catch (error) { console.warn('[Chat File AI] Could not remove a newly written API key after active-key restoration failed:', error); }
+            try { await rotateApiSecret(activeAfterWrite); }
+            catch { /* The operation below still fails closed. */ }
+            throw new Error('Could not restore the previously active shared custom API key.');
+        }
     }
     return id;
 }
@@ -878,12 +937,13 @@ async function saveApiPreset({ asNew = false, nameOverride = null, silent = fals
     if (!model && !allowMissingModel) throw new Error(s().modelRequired);
 
     let secretId = current?.secretId ?? null;
+    let obsoleteSecretId = null;
     if (asNew && !keyValue) secretId = presetById(apiDraftId)?.secretId ?? null;
     if (keyValue) {
         const oldSecretId = secretId;
-        secretId = await writeApiSecret(keyValue, name);
+        secretId = await writeApiSecret(keyValue, name, oldSecretId);
         if (oldSecretId && !settings.apiPresets.some(preset => preset.id !== current?.id && preset.secretId === oldSecretId)) {
-            await deleteApiSecret(oldSecretId);
+            obsoleteSecretId = oldSecretId;
         }
     }
     const now = new Date().toISOString();
@@ -899,6 +959,10 @@ async function saveApiPreset({ asNew = false, nameOverride = null, silent = fals
     save();
     showPreset(preset.id);
     renderVisibleCards();
+    if (obsoleteSecretId) {
+        try { await deleteApiSecret(obsoleteSecretId); }
+        catch (error) { console.warn('[Chat File AI] The replaced API key could not be removed:', error); }
+    }
     if (!silent) globalThis.toastr?.success(s().presetSaved);
     return preset;
 }
@@ -920,8 +984,9 @@ async function saveApiPresetAs() {
 async function deleteCurrentPreset() {
     const preset = presetById(apiDraftId);
     if (!preset || !await context.Popup.show.confirm(s().toolbar, s().deletePreset)) return;
-    settings.apiPresets = settings.apiPresets.filter(item => item.id !== preset.id);
-    if (preset.secretId && !settings.apiPresets.some(item => item.secretId === preset.secretId)) await deleteApiSecret(preset.secretId);
+    const remainingPresets = settings.apiPresets.filter(item => item.id !== preset.id);
+    if (preset.secretId && !remainingPresets.some(item => item.secretId === preset.secretId)) await deleteApiSecret(preset.secretId);
+    settings.apiPresets = remainingPresets;
     settings.config.customPresetId = settings.apiPresets[0]?.id ?? null;
     save();
     if (settings.config.customPresetId) showPreset(settings.config.customPresetId);
@@ -938,7 +1003,7 @@ async function fetchModels() {
         if (!preset) return;
         const response = await fetch('/api/backends/chat-completions/status', {
             method: 'POST', headers: context.getRequestHeaders(),
-            body: JSON.stringify({ chat_completion_source: 'custom', custom_url: preset.url, secret_id: preset.secretId }),
+            body: JSON.stringify({ chat_completion_source: 'custom', custom_url: preset.url, secret_id: preset.secretId ?? KEYLESS_SECRET_ID }),
         });
         const data = await response.json();
         const models = Array.isArray(data?.data) ? data.data.map(item => typeof item === 'string' ? item : item?.id).filter(Boolean) : [];
@@ -952,17 +1017,18 @@ async function fetchModels() {
     } finally { button.disabled = false; }
 }
 
-async function renderSettings() {
+async function renderSettings(expectedEpoch = lifecycleEpoch) {
     if (document.querySelector('#cfa_settings')) return;
     const html = await context.renderExtensionTemplateAsync(EXTENSION_FOLDER, 'settings');
+    if (!initialized || expectedEpoch !== lifecycleEpoch) return;
     document.querySelector('#extensions_settings2')?.insertAdjacentHTML('beforeend', html);
     const provider = document.querySelector('#cfa_provider_mode');
     const prompt = document.querySelector('#cfa_summary_prompt');
     const showUserName = document.querySelector('#cfa_show_user_name');
     const autoSummarize = document.querySelector('#cfa_auto_summarize');
     const autoSummaryInterval = document.querySelector('#cfa_auto_summary_interval');
-    const inputTokens = document.querySelector('#cfa_input_tokens');
     const outputTokens = document.querySelector('#cfa_output_tokens');
+    const concurrentRequests = document.querySelector('#cfa_concurrent_requests');
     const contextMode = document.querySelector('#cfa_context_mode');
     const recentMessageCount = document.querySelector('#cfa_recent_message_count');
     const writeChatFiles = document.querySelector('#cfa_write_chat_files');
@@ -972,8 +1038,8 @@ async function renderSettings() {
     autoSummarize.checked = settings.config.autoSummarize;
     autoSummaryInterval.value = settings.config.autoSummaryInterval;
     autoSummaryInterval.disabled = !settings.config.autoSummarize;
-    inputTokens.value = settings.config.maxInputTokens;
     outputTokens.value = settings.config.maxOutputTokens;
+    concurrentRequests.value = settings.config.maxConcurrentRequests;
     contextMode.value = settings.config.contextMode;
     recentMessageCount.value = settings.config.recentMessageCount;
     recentMessageCount.disabled = settings.config.contextMode !== 'recent';
@@ -1004,13 +1070,15 @@ async function renderSettings() {
         settings.config.autoSummaryInterval = Math.min(1000, Math.max(1, Math.round(Number(autoSummaryInterval.value) || 10)));
         autoSummaryInterval.value = settings.config.autoSummaryInterval; save();
     });
-    inputTokens.addEventListener('change', () => {
-        settings.config.maxInputTokens = Math.min(2000000, Math.max(1024, Number(inputTokens.value) || 2000000));
-        inputTokens.value = settings.config.maxInputTokens; save(); renderVisibleCards();
-    });
     outputTokens.addEventListener('change', () => {
         settings.config.maxOutputTokens = Math.min(65535, Math.max(64, Number(outputTokens.value) || 8096));
         outputTokens.value = settings.config.maxOutputTokens; save(); renderVisibleCards();
+    });
+    concurrentRequests.addEventListener('change', () => {
+        settings.config.maxConcurrentRequests = Math.min(20, Math.max(1, Math.round(Number(concurrentRequests.value) || 3)));
+        concurrentRequests.value = settings.config.maxConcurrentRequests;
+        setMaxConcurrentRequests(settings.config.maxConcurrentRequests);
+        save();
     });
     contextMode.addEventListener('change', () => {
         settings.config.contextMode = contextMode.value === 'recent' ? 'recent' : 'all';
@@ -1026,6 +1094,7 @@ async function renderSettings() {
     document.querySelector('#cfa_clear_data').addEventListener('click', async () => {
         if (await context.Popup.show.confirm(s().toolbar, s().clearConfirm)) await clearData();
     });
+    document.querySelector('#cfa_abort_all').addEventListener('click', abortAllSummaryRequests);
     writeChatFiles.addEventListener('change', () => {
         settings.config.writeToChatFiles = writeChatFiles.checked;
         save();
@@ -1050,50 +1119,70 @@ function setStorageProgress(current = 0, total = 0) {
     if (progress) progress.textContent = total ? s().progress(current, total) : '';
 }
 
-async function getScopeFileNames(scope) {
+async function getScopeFileNames(scope, signal = null) {
     if (scope.groupId) {
         const group = SillyTavern.getContext().groups?.find(item => String(item.id) === String(scope.groupId));
         return Array.isArray(group?.chats) ? group.chats.map(normalizeFileName) : [];
     }
     if (!scope.avatar) throw new Error(s().noActiveScope);
     const response = await fetch('/api/characters/chats', {
-        method: 'POST', headers: context.getRequestHeaders(), body: JSON.stringify({ avatar_url: scope.avatar, simple: true }),
+        method: 'POST', headers: context.getRequestHeaders(), body: JSON.stringify({ avatar_url: scope.avatar, simple: true }), signal,
     });
     if (!response.ok) throw new Error(`Unable to list chats (${response.status}).`);
     return (await response.json()).map(item => normalizeFileName(item.file_id ?? item.file_name));
 }
 
-async function runStorageTask(mode) {
-    if (storageTaskController) return;
+function runStorageTask(mode) {
+    if (storageTaskPromise) return storageTaskPromise;
     storageTaskController = new AbortController();
     const signal = storageTaskController.signal;
-    setStorageProgress();
-    try {
+    const taskEpoch = dataEpoch;
+    storageTaskPromise = (async () => {
+      setStorageProgress();
+      try {
         const scope = currentScope();
         await recordStore.loadScope(scope.key);
-        const files = await getScopeFileNames(scope);
-        for (let index = 0; index < files.length; index++) {
+        if (taskEpoch !== dataEpoch) throw new DOMException('The operation was aborted.', 'AbortError');
+        if (mode === 'embed' || mode === 'clear') {
             signal.throwIfAborted();
-            setStorageProgress(index + 1, files.length);
-            const fileName = files[index];
+            const fileName = normalizeFileName(SillyTavern.getContext().chatId);
+            if (!fileName) throw new Error(s().noActiveChat);
             if (mode === 'embed') {
                 const record = recordFor(scope.key, fileName);
-                if (record) await writeEmbeddedRecord(scope.key, fileName, record);
-            } else if (mode === 'rebuild') {
-                await restoreEmbeddedRecord(fileName, scope, null, { render: false });
-            } else if (mode === 'clear') {
+                if (!record) throw new Error(s().noStoredRecord);
+                signal.throwIfAborted();
+                await writeEmbeddedRecord(scope.key, fileName, record);
+            } else {
+                signal.throwIfAborted();
                 await removeEmbeddedRecord(scope.key, fileName);
+            }
+            globalThis.toastr?.success(s().storageDone);
+            return;
+        }
+        const files = await getScopeFileNames(scope, signal);
+        for (let index = 0; index < files.length; index++) {
+            signal.throwIfAborted();
+            if (taskEpoch !== dataEpoch) throw new DOMException('The operation was aborted.', 'AbortError');
+            setStorageProgress(index + 1, files.length);
+            const fileName = files[index];
+            if (mode === 'rebuild') {
+                const messages = await readChat(fileName, scope, signal);
+                signal.throwIfAborted();
+                if (taskEpoch !== dataEpoch) throw new DOMException('The operation was aborted.', 'AbortError');
+                await restoreEmbeddedRecord(fileName, scope, messages, { render: false });
             }
         }
         globalThis.toastr?.success(s().storageDone);
     } catch (error) {
         if (error?.name === 'AbortError') globalThis.toastr?.info(s().storageCancelled);
         else { console.error('[Chat File AI] Storage task failed:', error); globalThis.toastr?.error(error.message); }
-    } finally {
+      } finally {
         storageTaskController = null;
         setStorageProgress();
         renderVisibleCards();
-    }
+      }
+    })().finally(() => { storageTaskPromise = null; });
+    return storageTaskPromise;
 }
 
 async function markCurrentStale() {
@@ -1132,14 +1221,29 @@ function scheduleAutoSummary(_messageId, type) {
         await recordStore.loadScope(scope.key);
         if (!initialized) return;
         const record = recordFor(scope.key, fileName);
+        if (messageCount < Number(record?.autoRetryAfterCount ?? 0)) return;
         if (!shouldAutoSummarize({
             messageCount,
             lastSummaryCount: record?.messageCountAtGeneration,
             interval: settings.config.autoSummaryInterval,
             hasSummary: Boolean(record?.summary),
         })) return;
-        try { await generateFor(fileName); }
-        catch (error) { if (error?.name !== 'AbortError') console.warn('[Chat File AI] Automatic summary failed:', error); }
+        try { await generateFor(fileName, null, null, scope); }
+        catch (error) {
+            if (error?.name !== 'AbortError') {
+                console.warn('[Chat File AI] Automatic summary failed:', error);
+                const failureRecord = recordFor(scope.key, fileName, true);
+                const failures = Math.min(5, Math.max(0, Number(failureRecord.autoFailureCount) || 0) + 1);
+                failureRecord.autoFailureCount = failures;
+                failureRecord.autoRetryAfterCount = getAutoRetryAfterCount(
+                    messageCount,
+                    settings.config.autoSummaryInterval,
+                    failures,
+                );
+                try { await saveRecord(scope.key, fileName, failureRecord, { embed: false }); }
+                catch (saveError) { console.warn('[Chat File AI] Could not store automatic-summary backoff:', saveError); }
+            }
+        }
     }, 2000);
     autoSummaryTimers.set(timerKey, timer);
 }
@@ -1156,11 +1260,44 @@ function bindEvents() {
     }
     bind(events.MESSAGE_RECEIVED, scheduleAutoSummary);
     bind(events.CHAT_RENAMED, data => {
+        if (dataResetting) return;
         const scopeKey = getScopeKey({ groupId: data?.groupId, avatar: data?.avatarId });
         void recordStore.rename(scopeKey, data?.oldFileName, data?.newFileName).catch(error => console.warn('[Chat File AI] IndexedDB rename failed:', error));
     });
-    bind(events.CHAT_DELETED, fileName => { void recordStore.delete(currentScope().key, fileName); });
-    bind(events.GROUP_CHAT_DELETED, fileName => { void recordStore.delete(currentScope().key, fileName); });
+    bind(events.CHARACTER_RENAMED, (...args) => {
+        if (dataResetting) return;
+        const data = args[0] && typeof args[0] === 'object' ? args[0] : null;
+        const oldAvatar = String(data?.oldAvatar ?? data?.old_avatar ?? args[0] ?? '').trim();
+        const newAvatar = String(data?.newAvatar ?? data?.new_avatar ?? args[1] ?? '').trim();
+        if (!oldAvatar || !newAvatar || oldAvatar === '[object Object]' || newAvatar === '[object Object]') return;
+        const oldScope = getScopeKey({ avatar: oldAvatar });
+        const newScope = getScopeKey({ avatar: newAvatar });
+        void recordStore.moveScope(oldScope, newScope).then(() => {
+            if (metadataCache.has(oldScope)) metadataCache.set(newScope, metadataCache.get(oldScope));
+            if (metadataByScope.has(oldScope)) metadataByScope.set(newScope, metadataByScope.get(oldScope));
+            metadataCache.delete(oldScope); metadataByScope.delete(oldScope);
+            renderVisibleCards();
+        }).catch(error => console.warn('[Chat File AI] Character scope migration failed:', error));
+    });
+    bind(events.CHARACTER_DELETED, (...args) => {
+        if (dataResetting) return;
+        const data = args[0] && typeof args[0] === 'object' ? args[0] : null;
+        const avatar = String(data?.character?.avatar ?? data?.avatar ?? data?.avatar_url ?? data?.oldAvatar
+            ?? args.find(value => typeof value === 'string' && /\.[a-z0-9]+$/i.test(value)) ?? '').trim();
+        if (!avatar) return;
+        const scopeKey = getScopeKey({ avatar });
+        void recordStore.deleteScope(scopeKey).then(() => {
+            metadataCache.delete(scopeKey); metadataByScope.delete(scopeKey);
+        }).catch(error => console.warn('[Chat File AI] Character cache cleanup failed:', error));
+    });
+    bind(events.GROUP_CHAT_DELETED, fileName => {
+        if (dataResetting) return;
+        const scope = currentScope();
+        if (!scope.groupId) return;
+        const group = SillyTavern.getContext().groups?.find(item => String(item.id) === String(scope.groupId));
+        if (!group || group.chats?.map(normalizeFileName).includes(normalizeFileName(fileName))) return;
+        void recordStore.delete(scope.key, fileName).catch(error => console.warn('[Chat File AI] Group chat cache cleanup failed:', error));
+    });
 }
 
 function unbindEvents() {
@@ -1168,8 +1305,17 @@ function unbindEvents() {
 }
 
 async function clearData() {
+    if (dataResetting) return;
+    dataResetting = true;
+    dataEpoch += 1;
+    backgroundReadController.abort();
+    storageTaskController?.abort();
     for (const controller of activeControllers.values()) controller.abort();
-    await Promise.allSettled([...activeJobs.values()]);
+    await Promise.allSettled([
+        ...activeJobs.values(),
+        ...(storageTaskPromise ? [storageTaskPromise] : []),
+        ...(userNamePumpPromise ? [userNamePumpPromise] : []),
+    ]);
     userNameQueue.length = 0;
     userNameJobs.clear();
     embeddedChecked.clear();
@@ -1179,42 +1325,77 @@ async function clearData() {
     embeddedObserver?.disconnect(); embeddedObserver = null;
     for (const timer of autoSummaryTimers.values()) clearTimeout(timer);
     autoSummaryTimers.clear();
-    await recordStore.clearUser();
-    metadataCache.clear(); metadataByScope.clear();
-    save(); renderVisibleCards();
-    globalThis.toastr?.success(s().cleaned);
+    try {
+        await recordStore.clearUser();
+        metadataCache.clear(); metadataByScope.clear();
+        save(); renderVisibleCards();
+        globalThis.toastr?.success(s().cleaned);
+    } finally {
+        backgroundReadController = new AbortController();
+        dataResetting = false;
+    }
 }
 
 export async function onActivate() {
     if (initialized) return;
+    const activationEpoch = ++lifecycleEpoch;
     initialized = true;
-    context = SillyTavern.getContext();
-    const prior = context.extensionSettings[MODULE_NAME];
-    settings = normalizeSettings(prior);
+    const activationContext = SillyTavern.getContext();
+    const activationSettings = normalizeSettings(activationContext.extensionSettings[MODULE_NAME]);
+    const thisActivationController = new AbortController();
+    activationController = thisActivationController;
+    let activationStore;
     try {
-        recordStore = new IndexedRecordStore(await getUserHandle());
-        await recordStore.open();
+        const handle = await getUserHandle({ headers: activationContext.getRequestHeaders(), signal: thisActivationController.signal });
+        if (!initialized || activationEpoch !== lifecycleEpoch) return;
+        activationStore = new IndexedRecordStore(handle);
+        await activationStore.open();
     } catch (error) {
+        if (activationEpoch !== lifecycleEpoch) {
+            activationStore?.close();
+            return;
+        }
         initialized = false;
         console.error('[Chat File AI] IndexedDB initialization failed:', error);
         globalThis.toastr?.error(s().storageError);
         return;
     }
+    if (!initialized || activationEpoch !== lifecycleEpoch) {
+        activationStore?.close();
+        return;
+    }
+    context = activationContext;
+    settings = activationSettings;
+    recordStore = activationStore;
+    backgroundReadController = new AbortController();
+    dataResetting = false;
+    setMaxConcurrentRequests(settings.config.maxConcurrentRequests);
+    if (activationController === thisActivationController) activationController = null;
     context.extensionSettings[MODULE_NAME] = settings;
     save();
-    await renderSettings();
+    await renderSettings(activationEpoch);
+    if (!initialized || activationEpoch !== lifecycleEpoch) return;
     installFetchWrapper();
     bindEvents();
     startObserver();
 }
 
 export async function onDisable() {
+    ++lifecycleEpoch;
+    dataEpoch += 1;
     initialized = false;
+    const storeToClose = recordStore;
+    const jobsToWait = [
+        ...activeJobs.values(),
+        ...(storageTaskPromise ? [storageTaskPromise] : []),
+        ...(userNamePumpPromise ? [userNamePumpPromise] : []),
+    ];
+    activationController?.abort();
+    activationController = null;
     batchController?.abort();
     storageTaskController?.abort();
+    backgroundReadController.abort();
     for (const controller of activeControllers.values()) controller.abort();
-    await Promise.allSettled([...activeJobs.values()]);
-    activeControllers.clear();
     embeddedObserver?.disconnect(); embeddedObserver = null;
     for (const timer of autoSummaryTimers.values()) clearTimeout(timer);
     autoSummaryTimers.clear();
@@ -1224,8 +1405,11 @@ export async function onDisable() {
     stopObserver();
     uninstallFetchWrapper();
     unbindEvents();
-    recordStore?.close();
     document.querySelector('#cfa_settings')?.remove();
+    await Promise.allSettled(jobsToWait);
+    await storeToClose?.drain();
+    storeToClose?.close();
+    if (recordStore === storeToClose) recordStore = null;
 }
 
 export async function onClean() {
@@ -1237,10 +1421,16 @@ export async function onClean() {
         catch (error) { console.warn('[Chat File AI] Could not remove API secret during cleanup:', error); }
     }
     if (initialized) await onDisable();
-    const store = recordStore ?? new IndexedRecordStore(await getUserHandle());
-    try { await store.clearUser(); }
-    catch (error) { console.warn('[Chat File AI] Could not clear the current user\'s IndexedDB records:', error); }
-    store.close();
+    let store = recordStore;
+    if (!store) {
+        try { store = new IndexedRecordStore(await getUserHandle()); }
+        catch (error) { console.warn('[Chat File AI] Could not identify the current user during cleanup:', error); }
+    }
+    if (store) {
+        try { await store.clearUser(); }
+        catch (error) { console.warn('[Chat File AI] Could not clear the current user\'s IndexedDB records:', error); }
+        store.close();
+    }
     delete context.extensionSettings[MODULE_NAME];
     settings = normalizeSettings(null);
     recordStore = null;
