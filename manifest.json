@@ -1,0 +1,19 @@
+{
+  "display_name": "Chat File AI Assistant",
+  "loading_order": 50,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "yqbb",
+  "version": "1.0.0",
+  "auto_update": false,
+  "minimum_client_version": "1.18.0",
+  "i18n": {
+    "zh-cn": "i18n/zh-cn.json",
+    "en": "i18n/en.json"
+  },
+  "hooks": {
+    "activate": "onActivate",
+    "disable": "onDisable",
+    "clean": "onClean"
+  }
+}

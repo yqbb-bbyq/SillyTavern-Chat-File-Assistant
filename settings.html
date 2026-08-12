@@ -1,0 +1,97 @@
+<div id="cfa_settings" class="cfa-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b data-i18n="cfa_title">Chat File AI Assistant</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <p class="cfa-help" data-i18n="cfa_description">AI summaries and display aliases for Manage Chat Files. Data is kept in IndexedDB by default.</p>
+            <label for="cfa_provider_mode" data-i18n="cfa_provider">AI source</label>
+            <select id="cfa_provider_mode" class="text_pole wide100p">
+                <option value="current" data-i18n="cfa_provider_current">Current SillyTavern API and preset</option>
+                <option value="custom" data-i18n="cfa_provider_custom">OpenAI-compatible API preset</option>
+            </select>
+
+            <fieldset id="cfa_custom_api" class="cfa-api-box">
+                <legend data-i18n="cfa_api_presets">API presets</legend>
+                <label for="cfa_api_preset" data-i18n="cfa_current_preset">Current preset</label>
+                <select id="cfa_api_preset" class="text_pole wide100p"></select>
+                <div class="flex-container cfa-preset-actions">
+                    <button id="cfa_api_new" type="button" class="menu_button" data-i18n="cfa_new_preset">New blank preset</button>
+                    <button id="cfa_api_save" type="button" class="menu_button" data-i18n="cfa_save_preset">Save</button>
+                    <button id="cfa_api_save_as" type="button" class="menu_button" data-i18n="cfa_save_as">Save as</button>
+                    <button id="cfa_api_delete" type="button" class="menu_button danger_button" data-i18n="cfa_delete_preset">Delete</button>
+                </div>
+                <label><span data-i18n="cfa_preset_name">Preset name</span><input id="cfa_api_name" class="text_pole wide100p" type="text" autocomplete="off"></label>
+                <label><span data-i18n="cfa_api_url">API base URL</span><input id="cfa_api_url" class="text_pole wide100p" type="url" placeholder="https://api.deepseek.com/v1" autocomplete="off"></label>
+                <label><span data-i18n="cfa_api_key">API key</span><input id="cfa_api_key" class="text_pole wide100p" type="password" autocomplete="new-password"></label>
+                <label><span data-i18n="cfa_model">Model</span><input id="cfa_api_model" class="text_pole wide100p" type="text" list="cfa_model_list" autocomplete="off"></label>
+                <datalist id="cfa_model_list"></datalist>
+                <div class="flex-container alignitemscenter cfa-model-actions">
+                    <button id="cfa_fetch_models" type="button" class="menu_button" data-i18n="cfa_fetch_models">Fetch models</button>
+                    <small id="cfa_api_hint" class="cfa-help"></small>
+                </div>
+                <small class="cfa-help" data-i18n="cfa_current_generation_preset">Custom APIs use the currently selected Dialogue Completion generation preset. API keys are stored by the SillyTavern server.</small>
+            </fieldset>
+
+            <label for="cfa_summary_prompt" data-i18n="cfa_prompt">Summary prompt</label>
+            <textarea id="cfa_summary_prompt" class="text_pole wide100p" rows="8"></textarea>
+            <div class="cfa-option-row">
+                <label class="checkbox_label" for="cfa_show_user_name">
+                    <input id="cfa_show_user_name" type="checkbox">
+                    <span data-i18n="cfa_show_user_name">Show the chat's user name in display aliases</span>
+                </label>
+            </div>
+            <div class="cfa-option-row cfa-auto-summary-row">
+                <label class="checkbox_label" for="cfa_auto_summarize">
+                    <input id="cfa_auto_summarize" type="checkbox">
+                    <span data-i18n="cfa_auto_summarize">Automatically refresh summaries</span>
+                </label>
+                <label for="cfa_auto_summary_interval">
+                    <span data-i18n="cfa_auto_summary_interval">Refresh after this many new message layers</span>
+                    <input id="cfa_auto_summary_interval" class="text_pole" type="number" min="1" max="1000" step="1">
+                </label>
+                <small class="cfa-help" data-i18n="cfa_auto_summary_help">Default: 10 layers, equivalent to about 5 user/AI exchanges. Automatic generation can incur API charges.</small>
+            </div>
+            <div class="cfa-settings-grid">
+                <label><span data-i18n="cfa_input_tokens">Input token budget</span><input id="cfa_input_tokens" class="text_pole" type="number" min="1024" max="2000000" step="1024"></label>
+                <label><span data-i18n="cfa_output_tokens">Output token budget</span><input id="cfa_output_tokens" class="text_pole" type="number" min="64" max="65535" step="32"></label>
+            </div>
+            <fieldset class="cfa-api-box cfa-context-box">
+                <legend data-i18n="cfa_context_range">Chat context range</legend>
+                <label for="cfa_context_mode">
+                    <span data-i18n="cfa_context_mode">Messages to send</span>
+                    <select id="cfa_context_mode" class="text_pole wide100p">
+                        <option value="all" data-i18n="cfa_context_all">Send all (walk backward from the latest reply, up to the input budget)</option>
+                        <option value="recent" data-i18n="cfa_context_recent">Send the latest X message layers</option>
+                    </select>
+                </label>
+                <label for="cfa_recent_message_count">
+                    <span data-i18n="cfa_recent_message_count">Latest message layers</span>
+                    <input id="cfa_recent_message_count" class="text_pole" type="number" min="1" max="10000" step="1">
+                </label>
+                <small class="cfa-help" data-i18n="cfa_context_help">Both modes keep the newest content and stop at the input token budget. System messages do not count toward X but are retained when they fall inside the selected range.</small>
+            </fieldset>
+            <fieldset class="cfa-api-box cfa-storage-box">
+                <legend data-i18n="cfa_storage">Storage</legend>
+                <small class="cfa-help" data-i18n="cfa_storage_default">Summaries and aliases are stored in this browser's IndexedDB by default. Chat JSONL files are not modified.</small>
+                <label class="checkbox_label" for="cfa_write_chat_files">
+                    <input id="cfa_write_chat_files" type="checkbox">
+                    <span data-i18n="cfa_write_chat_files">Also write plugin data into each chat file</span>
+                </label>
+                <small class="cfa-help" data-i18n="cfa_write_warning">Embedded data follows exports and backups, but saving rewrites the chat JSONL. Enabling this does not rewrite old chats automatically.</small>
+                <div class="flex-container cfa-storage-actions">
+                    <button id="cfa_embed_existing" type="button" class="menu_button" data-i18n="cfa_embed_existing">Write this character/group's local data to chat files</button>
+                    <button id="cfa_rebuild_index" type="button" class="menu_button" data-i18n="cfa_rebuild_index">Rebuild this character/group's local index</button>
+                    <button id="cfa_clear_embedded" type="button" class="menu_button danger_button" data-i18n="cfa_clear_embedded">Remove embedded data for this character/group</button>
+                    <button id="cfa_cancel_storage" type="button" class="menu_button" data-i18n="cfa_cancel_storage">Cancel task</button>
+                </div>
+                <small id="cfa_storage_progress" class="cfa-help"></small>
+            </fieldset>
+            <div class="flex-container gap10px cfa-settings-actions">
+                <button id="cfa_reset_prompt" class="menu_button" data-i18n="cfa_reset_prompt">Reset prompt</button>
+                <button id="cfa_clear_data" class="menu_button danger_button" data-i18n="cfa_clear_data">Clear local index data</button>
+            </div>
+        </div>
+    </div>
+</div>
