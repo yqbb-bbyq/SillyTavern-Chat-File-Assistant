@@ -1,5 +1,3 @@
-import { normalizeFileName } from './core.js';
-
 const DATABASE_NAME = 'SillyTavern-Chat-File-Assistant-v1';
 const DATABASE_VERSION = 1;
 const STORE_NAME = 'records';
@@ -40,7 +38,7 @@ export class IndexedRecordStore {
     }
 
     id(scopeKey, fileName) {
-        return `${this.userHandle}\n${scopeKey}\n${normalizeFileName(fileName)}`;
+        return `${this.userHandle}\n${scopeKey}\n${String(fileName ?? '')}`;
     }
 
     async transaction(mode, callback) {
@@ -49,11 +47,26 @@ export class IndexedRecordStore {
             const transaction = database.transaction(STORE_NAME, mode);
             const store = transaction.objectStore(STORE_NAME);
             let result;
+            let callbackError = null;
+            let settled = false;
+            const rejectOnce = error => {
+                if (settled) return;
+                settled = true;
+                reject(error);
+            };
+            transaction.oncomplete = () => {
+                if (settled) return;
+                settled = true;
+                resolve(result);
+            };
+            transaction.onerror = () => rejectOnce(callbackError || transaction.error);
+            transaction.onabort = () => rejectOnce(callbackError || transaction.error || new Error('IndexedDB transaction aborted.'));
             try { result = callback(store, transaction); }
-            catch (error) { reject(error); return; }
-            transaction.oncomplete = () => resolve(result);
-            transaction.onerror = () => reject(transaction.error);
-            transaction.onabort = () => reject(transaction.error || new Error('IndexedDB transaction aborted.'));
+            catch (error) {
+                callbackError = error;
+                try { transaction.abort(); }
+                catch { rejectOnce(error); }
+            }
         });
     }
 
@@ -91,13 +104,13 @@ export class IndexedRecordStore {
 
     record(scopeKey, fileName, create = false) {
         const scope = this.scope(scopeKey, create);
-        const key = normalizeFileName(fileName);
+        const key = String(fileName ?? '');
         if (create && !Object.hasOwn(scope, key)) scope[key] = {};
         return scope?.[key];
     }
 
     async put(scopeKey, fileName, record) {
-        const key = normalizeFileName(fileName);
+        const key = String(fileName ?? '');
         return this.enqueueMutation(async () => {
             await this.transaction('readwrite', store => store.put({
                 id: this.id(scopeKey, key), userHandle: this.userHandle, scopeKey, fileName: key, record,
@@ -108,7 +121,7 @@ export class IndexedRecordStore {
     }
 
     async putMany(scopeKey, entries) {
-        const normalized = entries.map(([fileName, record]) => [normalizeFileName(fileName), record]);
+        const normalized = entries.map(([fileName, record]) => [String(fileName ?? ''), record]);
         return this.enqueueMutation(async () => {
             await this.transaction('readwrite', store => {
                 for (const [fileName, record] of normalized) {
@@ -125,8 +138,8 @@ export class IndexedRecordStore {
 
     async rename(scopeKey, oldFileName, newFileName) {
         await this.loadScope(scopeKey);
-        const oldKey = normalizeFileName(oldFileName);
-        const newKey = normalizeFileName(newFileName);
+        const oldKey = String(oldFileName ?? '');
+        const newKey = String(newFileName ?? '');
         return this.enqueueMutation(async () => {
             const record = this.record(scopeKey, oldKey);
             if (!record || oldKey === newKey) return;
@@ -144,7 +157,7 @@ export class IndexedRecordStore {
 
     async moveScope(oldScopeKey, newScopeKey) {
         if (!oldScopeKey || !newScopeKey || oldScopeKey === newScopeKey) return 0;
-        await this.loadScope(oldScopeKey);
+        await Promise.all([this.loadScope(oldScopeKey), this.loadScope(newScopeKey)]);
         return this.enqueueMutation(async () => {
             const moved = Object.entries(this.scope(oldScopeKey) ?? {});
             await this.transaction('readwrite', store => {
@@ -185,7 +198,7 @@ export class IndexedRecordStore {
     }
 
     async delete(scopeKey, fileName) {
-        const key = normalizeFileName(fileName);
+        const key = String(fileName ?? '');
         return this.enqueueMutation(async () => {
             await this.transaction('readwrite', store => store.delete(this.id(scopeKey, key)));
             const scope = this.scope(scopeKey);

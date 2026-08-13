@@ -112,8 +112,9 @@ export function isRecordStale(record, fingerprint, promptHash) {
     return record.stale === true || !fingerprintsEqual(record.fingerprint, fingerprint) || record.promptHash !== promptHash;
 }
 
-export function normalizeFileName(value) {
-    return String(value ?? '').replace(/\.jsonl$/i, '');
+export function normalizeFileName(value, { physical = false } = {}) {
+    const fileName = String(value ?? '');
+    return physical ? fileName.replace(/\.jsonl$/i, '') : fileName;
 }
 
 export function parseScopeKey(scopeKey) {
@@ -199,7 +200,7 @@ export function getChatUserName(messages = [], { skipHeader = false } = {}) {
 
 export function countConversationLayers(messages = [], { skipHeader = false } = {}) {
     const list = skipHeader ? messages.slice(1) : messages;
-    return list.filter(message => message && !message.is_system && (message.mes || message.content)).length;
+    return list.filter(message => message && !message.is_system).length;
 }
 
 export function shouldAutoSummarize({ messageCount, lastSummaryCount = 0, interval = 10, hasSummary = false } = {}) {
@@ -263,9 +264,14 @@ export function parseModelResult(raw) {
 }
 
 function validateModelResult(parsed) {
-    const summary = String(parsed?.summary ?? '').trim();
-    const title = cleanTitle(parsed?.title);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+        || typeof parsed.summary !== 'string' || typeof parsed.title !== 'string') {
+        throw new Error('The model response must contain string summary and title fields.');
+    }
+    const summary = parsed.summary.trim();
+    const title = cleanTitle(parsed.title);
     if (!summary || !title) throw new Error('The model response must contain non-empty summary and title fields.');
+    if ([...title].length > 24) throw new Error('The model response title must be no longer than 24 characters.');
     return { summary, title };
 }
 
@@ -296,15 +302,26 @@ export function serializeRecentMessages(messages = [], {
 function getSerializableEntries(messages, { skipHeader }) {
     const list = skipHeader ? messages.slice(1) : messages;
     return list
-        .filter(message => message && (message.mes || message.content))
+        .filter(message => message)
         .map((message, index) => ({ message, floor: index + 1 }));
+}
+
+function getMessageText(message) {
+    const primary = String(message?.mes ?? '').trim();
+    return primary || String(message?.content ?? '').trim();
 }
 
 function formatSerializableEntry({ message, floor }, textOverride) {
     const role = message.is_system ? 'SYSTEM-DATA' : message.is_user ? 'USER' : 'ASSISTANT';
     const name = String(message.name ?? message.character_name ?? role).replace(/[\r\n\]]/g, ' ');
-    const text = String(textOverride ?? message.mes ?? message.content ?? '').trim();
+    const text = textOverride === undefined ? getMessageText(message) : String(textOverride ?? '').trim();
     return `[Floor ${floor} | ${role} | ${name}]\n${text}`;
+}
+
+export function resolveAcceptedAlias(record, suggestedTitle) {
+    const acceptedAlias = String(record?.acceptedAlias ?? '').trim();
+    const previousSuggestion = String(record?.suggestedTitle ?? '').trim();
+    return !acceptedAlias || acceptedAlias === previousSuggestion ? suggestedTitle : acceptedAlias;
 }
 
 export function matchesAllFragments(record, query) {

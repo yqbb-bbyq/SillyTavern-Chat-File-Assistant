@@ -19,7 +19,9 @@ import {
     normalizeSettings,
     normalizeApiBaseUrl,
     normalizeFileName,
+    parseScopeKey,
     prepareStoredRecord,
+    resolveAcceptedAlias,
     serializeRecentMessages,
     shouldAutoSummarize,
     simpleHash,
@@ -52,6 +54,10 @@ const eventBindings = [];
 let previousFetch = null;
 let installedFetch = null;
 let installedFetchState = null;
+const completedChatRenames = new Map();
+const completedChatDeletes = new Map();
+const recordRedirects = new Map();
+const scopeRedirects = new Map();
 let embeddedObserver = null;
 let storageTaskController = null;
 let storageTaskPromise = null;
@@ -132,6 +138,69 @@ function ensureScopeRecords(scopeKey) {
 
 function recordFor(scopeKey, fileName, create = false) {
     return recordStore.record(scopeKey, fileName, create);
+}
+
+function recordTargetKey(scopeKey, fileName) {
+    return `${scopeKey}\n${normalizeFileName(fileName)}`;
+}
+
+export function registerRecordRedirect(sourceScope, sourceFileName, targetScope, targetFileName, ready) {
+    const key = recordTargetKey(sourceScope.key, sourceFileName);
+    recordRedirects.set(key, {
+        scope: { ...targetScope },
+        fileName: normalizeFileName(targetFileName),
+        ready: Promise.resolve(ready).catch(() => {}),
+    });
+    if (recordRedirects.size > 100) recordRedirects.delete(recordRedirects.keys().next().value);
+}
+
+export function registerScopeRedirect(sourceScopeKey, targetScope, ready) {
+    scopeRedirects.set(sourceScopeKey, {
+        scope: { ...targetScope },
+        ready: Promise.resolve(ready).catch(() => {}),
+    });
+    if (scopeRedirects.size > 50) scopeRedirects.delete(scopeRedirects.keys().next().value);
+}
+
+export async function resolveRecordTarget(scope, fileName) {
+    let target = { scope: { ...scope }, fileName: normalizeFileName(fileName) };
+    const visited = new Set();
+    for (let index = 0; index < 20; index++) {
+        const key = recordTargetKey(target.scope.key, target.fileName);
+        if (visited.has(key)) break;
+        visited.add(key);
+        const recordRedirect = recordRedirects.get(key);
+        if (recordRedirect) {
+            await recordRedirect.ready;
+            target = { scope: { ...recordRedirect.scope }, fileName: recordRedirect.fileName };
+            continue;
+        }
+        const scopeRedirect = scopeRedirects.get(target.scope.key);
+        if (!scopeRedirect) break;
+        await scopeRedirect.ready;
+        target.scope = { ...scopeRedirect.scope };
+    }
+    return target;
+}
+
+export function clearRecordRedirects() {
+    recordRedirects.clear();
+    scopeRedirects.clear();
+}
+
+function aliasActiveJob(sourceScopeKey, sourceFileName, targetScopeKey, targetFileName) {
+    const sourceKey = recordTargetKey(sourceScopeKey, sourceFileName);
+    const targetKey = recordTargetKey(targetScopeKey, targetFileName);
+    const job = activeJobs.get(sourceKey);
+    if (!job || activeJobs.has(targetKey)) return;
+    const controller = activeControllers.get(sourceKey);
+    activeJobs.set(targetKey, job);
+    if (controller) activeControllers.set(targetKey, controller);
+    const cleanup = () => {
+        if (activeJobs.get(targetKey) === job) activeJobs.delete(targetKey);
+        if (controller && activeControllers.get(targetKey) === controller) activeControllers.delete(targetKey);
+    };
+    job.then(cleanup, cleanup);
 }
 
 async function reconcileScopeRecords(scopeKey, nativeResults, expectedEpoch = dataEpoch) {
@@ -224,6 +293,85 @@ export function parseDeletedGroupId(input, init, baseUrl = globalThis.location?.
     }
 }
 
+export function parseChatDeleteRequest(input, init, baseUrl = globalThis.location?.href ?? 'http://localhost/') {
+    try {
+        const base = new URL(baseUrl);
+        const url = typeof input === 'string' || input instanceof URL ? new URL(input, baseUrl) : new URL(input.url, baseUrl);
+        if (url.origin !== base.origin || url.pathname !== '/api/chats/delete' || typeof init?.body !== 'string') return null;
+        const body = JSON.parse(init.body);
+        const avatar = String(body?.avatar_url ?? '').trim();
+        const fileName = normalizeFileName(body?.chatfile, { physical: true });
+        if (!avatar || !fileName) return null;
+        return { scopeKey: getScopeKey({ avatar }), fileName };
+    } catch {
+        return null;
+    }
+}
+
+function rememberChatDelete(request) {
+    if (!request) return;
+    const pending = completedChatDeletes.get(request.fileName) ?? [];
+    pending.push(request);
+    completedChatDeletes.set(request.fileName, pending);
+    if (completedChatDeletes.size > 50) completedChatDeletes.delete(completedChatDeletes.keys().next().value);
+}
+
+export function resolveChatDeleteEvent(fileName) {
+    const normalized = normalizeFileName(fileName);
+    const pending = completedChatDeletes.get(normalized);
+    if (!pending?.length) return null;
+    const request = pending.shift();
+    if (!pending.length) completedChatDeletes.delete(normalized);
+    return request;
+}
+
+function chatRenameKey(scopeKey, oldFileName, requestedFileName) {
+    return `${scopeKey ?? 'group:*'}\n${oldFileName}\n${requestedFileName}`;
+}
+
+export function parseChatRenameRequest(input, init, baseUrl = globalThis.location?.href ?? 'http://localhost/') {
+    try {
+        const base = new URL(baseUrl);
+        const url = typeof input === 'string' || input instanceof URL ? new URL(input, baseUrl) : new URL(input.url, baseUrl);
+        if (url.origin !== base.origin || url.pathname !== '/api/chats/rename' || typeof init?.body !== 'string') return null;
+        const body = JSON.parse(init.body);
+        const scopeKey = body.is_group ? null : getScopeKey({ avatar: body.avatar_url });
+        const oldFileName = normalizeFileName(body.original_file, { physical: true });
+        const requestedFileName = normalizeFileName(body.renamed_file, { physical: true });
+        if (!oldFileName || !requestedFileName) return null;
+        return { scopeKey, oldFileName, requestedFileName };
+    } catch {
+        return null;
+    }
+}
+
+function rememberChatRename(request, responseBody) {
+    const actualFileName = normalizeFileName(responseBody?.sanitizedFileName);
+    if (!request || !actualFileName) return;
+    const key = chatRenameKey(request.scopeKey, request.oldFileName, request.requestedFileName);
+    completedChatRenames.set(key, actualFileName);
+    if (completedChatRenames.size > 50) completedChatRenames.delete(completedChatRenames.keys().next().value);
+}
+
+function takeChatRename(scopeKey, oldFileName, requestedFileName) {
+    const exactKey = chatRenameKey(scopeKey, oldFileName, requestedFileName);
+    const groupKey = chatRenameKey(null, oldFileName, requestedFileName);
+    const key = completedChatRenames.has(exactKey)
+        ? exactKey
+        : String(scopeKey).startsWith('group:') ? groupKey : exactKey;
+    const actualFileName = completedChatRenames.get(key);
+    completedChatRenames.delete(key);
+    return actualFileName;
+}
+
+export function resolveChatRenameEvent(data) {
+    const scopeKey = getScopeKey({ groupId: data?.groupId, avatar: data?.avatarId });
+    const oldFileName = normalizeFileName(data?.oldFileName, { physical: true });
+    const requestedFileName = normalizeFileName(data?.newFileName, { physical: true });
+    const newFileName = takeChatRename(scopeKey, oldFileName, requestedFileName) ?? requestedFileName;
+    return { scopeKey, oldFileName, newFileName };
+}
+
 export function installFetchWrapper() {
     if (fetchInstalled) return;
     const delegate = globalThis.fetch;
@@ -234,12 +382,19 @@ export function installFetchWrapper() {
         if (!state.enabled) return Reflect.apply(delegate, globalThis, [input, init]);
         const parsed = parseSearchRequest(input, init);
         const deletedGroupId = parseDeletedGroupId(input, init);
+        const chatDelete = parseChatDeleteRequest(input, init);
+        const chatRename = parseChatRenameRequest(input, init);
         const query = String(parsed?.body?.query ?? '').trim();
         if (parsed && !query && settings.config.writeToChatFiles && !parsed.body.group_id) {
             try { return await fetchCharacterListWithMetadata(parsed, init, delegate); }
             catch (error) { console.warn('[Chat File AI] Batched chat metadata load failed; using the native search:', error); }
         }
         const response = await Reflect.apply(delegate, globalThis, [input, init]);
+        if (chatRename && response.ok) {
+            try { rememberChatRename(chatRename, await response.clone().json()); }
+            catch (error) { console.warn('[Chat File AI] Could not capture the sanitized chat name:', error); }
+        }
+        if (chatDelete && response.ok) rememberChatDelete(chatDelete);
         if (deletedGroupId && response.ok) {
             const scopeKey = getScopeKey({ groupId: deletedGroupId });
             void recordStore.deleteScope(scopeKey).then(() => {
@@ -305,7 +460,9 @@ async function fetchCharacterListWithMetadata(parsed, init, delegate) {
     const nativeResults = [];
     const embeddedRecords = [];
     for (const item of source) {
-        const fileName = normalizeFileName(item.file_id ?? item.file_name);
+        const fileName = item.file_id !== undefined
+            ? normalizeFileName(item.file_id)
+            : normalizeFileName(item.file_name, { physical: true });
         embeddedChecked.add(`${parsed.scopeKey}\n${fileName}`);
         const message = String(item.mes ?? '');
         nativeResults.push({
@@ -342,6 +499,8 @@ export function uninstallFetchWrapper() {
     installedFetch = null;
     installedFetchState = null;
     previousFetch = null;
+    completedChatRenames.clear();
+    completedChatDeletes.clear();
 }
 
 async function readChat(fileName, scope = currentScope(), signal = null) {
@@ -402,6 +561,19 @@ function metaFor(scopeKey, fileName) {
     return metadataByScope.get(scopeKey)?.get(normalizeFileName(fileName)) ?? {};
 }
 
+async function readResolvedChat(scope, fileName, signal) {
+    let target = await resolveRecordTarget(scope, fileName);
+    for (let index = 0; index < 5; index++) {
+        const messages = await readChat(target.fileName, target.scope, signal);
+        const latestTarget = await resolveRecordTarget(target.scope, target.fileName);
+        if (latestTarget.scope.key === target.scope.key && latestTarget.fileName === target.fileName) {
+            return { ...target, messages };
+        }
+        target = latestTarget;
+    }
+    throw new Error('The chat was renamed repeatedly while the operation was running.');
+}
+
 async function generateFor(fileName, card = null, externalSignal = null, targetScope = currentScope()) {
     if (dataResetting) throw new DOMException('The local index is being reset.', 'AbortError');
     const scope = { ...targetScope };
@@ -416,7 +588,8 @@ async function generateFor(fileName, card = null, externalSignal = null, targetS
         try {
             const taskConfig = generationConfig();
             const taskPromptHash = configHash(taskConfig);
-            const rawMessages = await readChat(fileName, scope, controller.signal);
+            const initialTarget = await resolveRecordTarget(scope, fileName);
+            const rawMessages = await readChat(initialTarget.fileName, initialTarget.scope, controller.signal);
             const skipHeader = !scope.groupId;
             const serialized = serializeRecentMessages(rawMessages, {
                 skipHeader,
@@ -428,36 +601,43 @@ async function generateFor(fileName, card = null, externalSignal = null, targetS
                 updateCardProgress(card, progress);
             });
             controller.signal.throwIfAborted();
-            const latestMessages = await readChat(fileName, scope, controller.signal);
+            const resolved = await readResolvedChat(initialTarget.scope, initialTarget.fileName, controller.signal);
+            const latestMessages = resolved.messages;
             if (taskDataEpoch !== dataEpoch) throw new DOMException('The operation was aborted.', 'AbortError');
-            if (!chatGuardsEqual(messagesFingerprint(rawMessages, scope), messagesFingerprint(latestMessages, scope))) {
+            if (!chatGuardsEqual(messagesFingerprint(rawMessages, scope), messagesFingerprint(latestMessages, resolved.scope))) {
                 throw new Error(s().generationChanged);
             }
             const contentMessages = skipHeader ? rawMessages.slice(1) : rawMessages;
-            const lastMessage = contentMessages.findLast(message => message && !message.is_system && (message.mes || message.content));
-            const cachedMeta = metaFor(scope.key, fileName);
+            const lastMessage = contentMessages.findLast(message => message && !message.is_system);
+            const cachedMeta = metaFor(resolved.scope.key, resolved.fileName);
             const meta = {
                 ...cachedMeta,
                 last_mes: lastMessage?.send_date ?? cachedMeta.last_mes ?? null,
                 message_count: countConversationLayers(rawMessages, { skipHeader }),
                 file_size: cachedMeta.file_size ?? '',
             };
-            const existing = recordFor(scope.key, fileName, true);
-            const aliasDate = chooseChatDate({ messages: rawMessages, fileName, lastMes: meta.last_mes });
+            const existing = recordFor(resolved.scope.key, resolved.fileName, true);
+            const aliasDate = chooseChatDate({ messages: rawMessages, fileName: resolved.fileName, lastMes: meta.last_mes });
             const userName = getChatUserName(rawMessages, { skipHeader });
             const messageCountAtGeneration = countConversationLayers(rawMessages, { skipHeader });
+            const suggestedTitle = formatAlias(aliasDate, result.title);
+            const acceptedAlias = resolveAcceptedAlias(existing, suggestedTitle);
             Object.assign(existing, {
                 fingerprint: getFingerprint(meta), promptHash: taskPromptHash, summary: result.summary,
-                suggestedTitle: formatAlias(aliasDate, result.title), acceptedAlias: formatAlias(aliasDate, result.title),
+                suggestedTitle, acceptedAlias,
                 userName: userName || existing.userName || '', messageCountAtGeneration,
                 generatedAt: new Date().toISOString(), stale: false,
                 generator: { mode: taskConfig.providerMode, presetId: taskConfig.customPresetId },
             });
             delete existing.autoFailureCount;
             delete existing.autoRetryAfterCount;
-            await saveRecord(scope.key, fileName, existing, { messages: latestMessages });
+            const finalTarget = await resolveRecordTarget(resolved.scope, resolved.fileName);
+            const finalRecord = finalTarget.scope.key === resolved.scope.key && finalTarget.fileName === resolved.fileName
+                ? existing
+                : Object.assign(recordFor(finalTarget.scope.key, finalTarget.fileName, true), existing);
+            await saveRecord(finalTarget.scope.key, finalTarget.fileName, finalRecord, { messages: latestMessages });
             renderVisibleCards();
-            return existing;
+            return finalRecord;
         } catch (error) {
             if (error?.name !== 'AbortError') {
                 console.error('[Chat File AI] Generation failed:', error);
@@ -551,6 +731,14 @@ async function editSummary(fileName) {
     renderVisibleCards();
 }
 
+export function handleSummaryPreviewClick(preview, event) {
+    if (preview.classList.contains('cfa-expanded')) return false;
+    event.stopPropagation();
+    preview.classList.add('cfa-expanded');
+    preview.setAttribute('aria-expanded', 'true');
+    return true;
+}
+
 function enhanceCard(wrapper) {
     const block = wrapper.querySelector('.select_chat_block');
     const originalNameElement = wrapper.querySelector('.select_chat_block_filename');
@@ -600,10 +788,12 @@ function enhanceCard(wrapper) {
         preview.textContent = record.summary;
         preview.classList.add('cfa-summary');
         preview.classList.toggle('cfa-stale', stale);
-        preview.onclick = event => { event.stopPropagation(); preview.classList.toggle('cfa-expanded'); };
+        preview.setAttribute('aria-expanded', String(preview.classList.contains('cfa-expanded')));
+        preview.onclick = event => handleSummaryPreviewClick(preview, event);
     } else {
         preview.textContent = nativePreview;
         preview.classList.remove('cfa-summary', 'cfa-stale', 'cfa-expanded');
+        preview.removeAttribute('aria-expanded');
         preview.onclick = null;
     }
 }
@@ -625,20 +815,22 @@ function pumpUserNameQueue() {
             const job = userNameQueue.shift();
             try {
                 if (job.epoch !== dataEpoch) continue;
-                const messages = await readChat(job.fileName, job.scope, backgroundReadController.signal);
+                let target = await resolveRecordTarget(job.scope, job.fileName);
+                const messages = await readChat(target.fileName, target.scope, backgroundReadController.signal);
                 if (!initialized || job.epoch !== dataEpoch) continue;
+                target = await resolveRecordTarget(target.scope, target.fileName);
                 if (job.restoreEmbedded) {
                     if (!settings.config.writeToChatFiles) continue;
-                    await restoreEmbeddedRecord(job.fileName, job.scope, messages);
+                    await restoreEmbeddedRecord(target.fileName, target.scope, messages);
                     continue;
                 }
-                const userName = getChatUserName(messages, { skipHeader: !job.scope.groupId });
+                const userName = getChatUserName(messages, { skipHeader: !target.scope.groupId });
                 if (userName) {
-                    recordFor(job.scope.key, job.fileName, true).userName = userName;
-                    await saveRecord(job.scope.key, job.fileName, recordFor(job.scope.key, job.fileName), { embed: false });
-                    if (currentScope().key === job.scope.key) {
+                    recordFor(target.scope.key, target.fileName, true).userName = userName;
+                    await saveRecord(target.scope.key, target.fileName, recordFor(target.scope.key, target.fileName), { embed: false });
+                    if (currentScope().key === target.scope.key) {
                         const card = [...document.querySelectorAll('#select_chat_div .select_chat_block_wrapper')]
-                            .find(item => item.dataset.cfaFile === job.fileName);
+                            .find(item => item.dataset.cfaFile === target.fileName);
                         if (card) enhanceCard(card);
                     }
                 }
@@ -1129,7 +1321,9 @@ async function getScopeFileNames(scope, signal = null) {
         method: 'POST', headers: context.getRequestHeaders(), body: JSON.stringify({ avatar_url: scope.avatar, simple: true }), signal,
     });
     if (!response.ok) throw new Error(`Unable to list chats (${response.status}).`);
-    return (await response.json()).map(item => normalizeFileName(item.file_id ?? item.file_name));
+    return (await response.json()).map(item => item.file_id !== undefined
+        ? normalizeFileName(item.file_id)
+        : normalizeFileName(item.file_name, { physical: true }));
 }
 
 function runStorageTask(mode) {
@@ -1166,10 +1360,12 @@ function runStorageTask(mode) {
             setStorageProgress(index + 1, files.length);
             const fileName = files[index];
             if (mode === 'rebuild') {
-                const messages = await readChat(fileName, scope, signal);
+                let target = await resolveRecordTarget(scope, fileName);
+                const messages = await readChat(target.fileName, target.scope, signal);
                 signal.throwIfAborted();
                 if (taskEpoch !== dataEpoch) throw new DOMException('The operation was aborted.', 'AbortError');
-                await restoreEmbeddedRecord(fileName, scope, messages, { render: false });
+                target = await resolveRecordTarget(target.scope, target.fileName);
+                await restoreEmbeddedRecord(target.fileName, target.scope, messages, { render: false });
             }
         }
         globalThis.toastr?.success(s().storageDone);
@@ -1190,10 +1386,11 @@ async function markCurrentStale() {
     const scope = currentScope();
     await recordStore.loadScope(scope.key);
     if (!initialized) return;
-    const record = recordFor(scope.key, ctx.chatId);
+    const target = await resolveRecordTarget(scope, ctx.chatId);
+    const record = recordFor(target.scope.key, target.fileName);
     if (record) {
         record.stale = true;
-        await saveRecord(scope.key, ctx.chatId, record, { embed: false });
+        await saveRecord(target.scope.key, target.fileName, record, { embed: false });
         renderVisibleCards();
     }
 }
@@ -1218,9 +1415,10 @@ function scheduleAutoSummary(_messageId, type) {
         try { rawMessages = await readChat(fileName, scope); }
         catch (error) { console.warn('[Chat File AI] Could not read chat for automatic summary:', error); return; }
         const messageCount = countConversationLayers(rawMessages, { skipHeader: !scope.groupId });
-        await recordStore.loadScope(scope.key);
+        const target = await resolveRecordTarget(scope, fileName);
+        await recordStore.loadScope(target.scope.key);
         if (!initialized) return;
-        const record = recordFor(scope.key, fileName);
+        const record = recordFor(target.scope.key, target.fileName);
         if (messageCount < Number(record?.autoRetryAfterCount ?? 0)) return;
         if (!shouldAutoSummarize({
             messageCount,
@@ -1228,11 +1426,12 @@ function scheduleAutoSummary(_messageId, type) {
             interval: settings.config.autoSummaryInterval,
             hasSummary: Boolean(record?.summary),
         })) return;
-        try { await generateFor(fileName, null, null, scope); }
+        try { await generateFor(target.fileName, null, null, target.scope); }
         catch (error) {
             if (error?.name !== 'AbortError') {
                 console.warn('[Chat File AI] Automatic summary failed:', error);
-                const failureRecord = recordFor(scope.key, fileName, true);
+                const failureTarget = await resolveRecordTarget(target.scope, target.fileName);
+                const failureRecord = recordFor(failureTarget.scope.key, failureTarget.fileName, true);
                 const failures = Math.min(5, Math.max(0, Number(failureRecord.autoFailureCount) || 0) + 1);
                 failureRecord.autoFailureCount = failures;
                 failureRecord.autoRetryAfterCount = getAutoRetryAfterCount(
@@ -1240,7 +1439,7 @@ function scheduleAutoSummary(_messageId, type) {
                     settings.config.autoSummaryInterval,
                     failures,
                 );
-                try { await saveRecord(scope.key, fileName, failureRecord, { embed: false }); }
+                try { await saveRecord(failureTarget.scope.key, failureTarget.fileName, failureRecord, { embed: false }); }
                 catch (saveError) { console.warn('[Chat File AI] Could not store automatic-summary backoff:', saveError); }
             }
         }
@@ -1261,8 +1460,13 @@ function bindEvents() {
     bind(events.MESSAGE_RECEIVED, scheduleAutoSummary);
     bind(events.CHAT_RENAMED, data => {
         if (dataResetting) return;
-        const scopeKey = getScopeKey({ groupId: data?.groupId, avatar: data?.avatarId });
-        void recordStore.rename(scopeKey, data?.oldFileName, data?.newFileName).catch(error => console.warn('[Chat File AI] IndexedDB rename failed:', error));
+        const { scopeKey, oldFileName, newFileName } = resolveChatRenameEvent(data);
+        const scope = parseScopeKey(scopeKey);
+        const targetScope = { key: scopeKey, ...scope };
+        const migration = recordStore.rename(scopeKey, oldFileName, newFileName);
+        registerRecordRedirect(targetScope, oldFileName, targetScope, newFileName, migration);
+        aliasActiveJob(scopeKey, oldFileName, scopeKey, newFileName);
+        void migration.catch(error => console.warn('[Chat File AI] IndexedDB rename failed:', error));
     });
     bind(events.CHARACTER_RENAMED, (...args) => {
         if (dataResetting) return;
@@ -1272,7 +1476,14 @@ function bindEvents() {
         if (!oldAvatar || !newAvatar || oldAvatar === '[object Object]' || newAvatar === '[object Object]') return;
         const oldScope = getScopeKey({ avatar: oldAvatar });
         const newScope = getScopeKey({ avatar: newAvatar });
-        void recordStore.moveScope(oldScope, newScope).then(() => {
+        const targetScope = { key: newScope, groupId: null, avatar: newAvatar };
+        const migration = recordStore.moveScope(oldScope, newScope);
+        registerScopeRedirect(oldScope, targetScope, migration);
+        for (const key of [...activeJobs.keys()]) {
+            const prefix = `${oldScope}\n`;
+            if (key.startsWith(prefix)) aliasActiveJob(oldScope, key.slice(prefix.length), newScope, key.slice(prefix.length));
+        }
+        void migration.then(() => {
             if (metadataCache.has(oldScope)) metadataCache.set(newScope, metadataCache.get(oldScope));
             if (metadataByScope.has(oldScope)) metadataByScope.set(newScope, metadataByScope.get(oldScope));
             metadataCache.delete(oldScope); metadataByScope.delete(oldScope);
@@ -1289,6 +1500,22 @@ function bindEvents() {
         void recordStore.deleteScope(scopeKey).then(() => {
             metadataCache.delete(scopeKey); metadataByScope.delete(scopeKey);
         }).catch(error => console.warn('[Chat File AI] Character cache cleanup failed:', error));
+    });
+    bind(events.CHAT_DELETED, fileName => {
+        if (dataResetting) return;
+        const target = resolveChatDeleteEvent(fileName);
+        if (!target) return;
+        activeControllers.get(recordTargetKey(target.scopeKey, target.fileName))?.abort();
+        void recordStore.delete(target.scopeKey, target.fileName).then(() => {
+            const cached = metadataCache.get(target.scopeKey);
+            if (cached) {
+                metadataCache.set(target.scopeKey, cached.filter(item => (
+                    normalizeFileName(item.file_name ?? item.file_id) !== target.fileName
+                )));
+            }
+            metadataByScope.get(target.scopeKey)?.delete(target.fileName);
+            renderVisibleCards();
+        }).catch(error => console.warn('[Chat File AI] Character chat cache cleanup failed:', error));
     });
     bind(events.GROUP_CHAT_DELETED, fileName => {
         if (dataResetting) return;
@@ -1319,6 +1546,9 @@ async function clearData() {
     userNameQueue.length = 0;
     userNameJobs.clear();
     embeddedChecked.clear();
+    completedChatRenames.clear();
+    completedChatDeletes.clear();
+    clearRecordRedirects();
     settings.config.writeToChatFiles = false;
     const writeToggle = document.querySelector('#cfa_write_chat_files');
     if (writeToggle) writeToggle.checked = false;
@@ -1399,6 +1629,9 @@ export async function onDisable() {
     embeddedObserver?.disconnect(); embeddedObserver = null;
     for (const timer of autoSummaryTimers.values()) clearTimeout(timer);
     autoSummaryTimers.clear();
+    completedChatRenames.clear();
+    completedChatDeletes.clear();
+    clearRecordRedirects();
     userNameQueue.length = 0;
     userNameJobs.clear();
     embeddedChecked.clear();

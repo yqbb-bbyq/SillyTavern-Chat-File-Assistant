@@ -89,7 +89,6 @@ async function waitForAbortable(promise, signal, onAbort = () => {}) {
 
 export async function requestSummary(text, config, context, signal, phase = 'chat') {
     signal?.throwIfAborted();
-    setMaxConcurrentRequests(config.maxConcurrentRequests);
     return runWithConcurrencyLimit(() => requestSummaryNow(text, config, context, signal, phase), signal);
 }
 
